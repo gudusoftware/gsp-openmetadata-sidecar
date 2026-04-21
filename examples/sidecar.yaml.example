@@ -1,0 +1,39 @@
+# gsp-openmetadata-sidecar configuration
+#
+# Copy this file to sidecar.yaml and customize.
+
+sqlflow:
+  # Backend mode: anonymous | authenticated | self_hosted | local_jar
+  mode: anonymous
+
+  # For authenticated mode (10k calls/month):
+  # mode: authenticated
+  # user_id: "your-user-id"
+  # secret_key: "your-secret-key"
+
+  # For self-hosted SQLFlow Docker (unlimited):
+  # mode: self_hosted
+  # url: "http://localhost:8165/api/gspLive_backend/sqlflow/generation/sqlflow/exportFullLineageAsJson"
+  # user_id: "gudu"
+  # secret_key: "0123456789"
+
+  # SQL dialect (default: dbvmssql)
+  db_vendor: dbvmssql
+
+openmetadata:
+  # OpenMetadata API server
+  server: "http://localhost:8585/api"
+
+  # JWT token for authentication (get from Settings > Bots in OpenMetadata UI)
+  # token: "eyJ..."
+
+  # Database service name as registered in OpenMetadata
+  service_name: "mssql_prod"
+
+  # Default database and schema for FQN resolution
+  # (used when SQL references tables without full qualification)
+  database_name: "SalesDB"
+  schema_name: "dbo"
+
+  # Emit column-level lineage (default: true)
+  column_lineage: true

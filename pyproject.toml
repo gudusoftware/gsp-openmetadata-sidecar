@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsp-openmetadata-sidecar"
+version = "0.1.0"
+description = "Recovers SQL lineage that OpenMetadata's parser misses — MSSQL stored procedures, BigQuery procedural SQL, and 20+ dialects — using Gudu SQLFlow."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [
+    {name = "Gudu Software", email = "info@gudusoft.com"},
+]
+keywords = ["openmetadata", "lineage", "mssql", "stored-procedure", "sql-parser", "sqlflow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "requests>=2.28",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-mock>=3.10",
+    "responses>=0.23",
+]
+
+[project.urls]
+Homepage = "https://sqlparser.com/openmetadata/"
+Repository = "https://github.com/gudusoftware/gsp-openmetadata-sidecar"
+Issues = "https://github.com/gudusoftware/gsp-openmetadata-sidecar/issues"
+
+[project.scripts]
+gsp-openmetadata-sidecar = "gsp_openmetadata_sidecar.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
