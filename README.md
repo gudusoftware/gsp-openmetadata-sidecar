@@ -81,10 +81,72 @@ gsp-openmetadata-sidecar --config sidecar.yaml --sql-file stored_proc.sql
 
 ## How it works
 
-1. **Parse SQL** — sends your SQL to [Gudu SQLFlow](https://sqlflow.gudusoft.com) (cloud API, self-hosted Docker, or local JAR — your choice)
-2. **Extract lineage** — maps SQLFlow's response to table-level and column-level lineage relationships
-3. **Resolve entities** — looks up table FQNs in OpenMetadata via `GET /api/v1/tables/name/{fqn}` to get entity UUIDs
-4. **Push lineage** — sends lineage edges to OpenMetadata via `PUT /api/v1/lineage` with column-level detail
+The sidecar is a bridge between two systems: **SQLFlow** (which understands SQL) and **OpenMetadata** (which stores metadata). It does not parse SQL itself.
+
+### Pipeline
+
+```
+SQL file / inline SQL
+        |
+        v
+  [1] SQLFlow API ───── parses SQL, returns table & column relationships
+        |                (the sidecar sends raw SQL + dialect, nothing else)
+        v
+  [2] Lineage mapper ── extracts upstream/downstream table pairs + column mappings
+        |                from SQLFlow's JSON response
+        v
+  [3] FQN builder ───── converts SQLFlow table names (e.g. SALESDB.DBO.CUSTOMERS)
+        |                to OpenMetadata FQNs (e.g. mssql.salesdb.dbo.customers)
+        |                using --service-name, --database-name, --schema-name
+        v
+  [4] Entity lookup ─── looks up each FQN in OpenMetadata to get entity UUIDs
+        |                (exact match first, then case-insensitive search fallback)
+        v
+  [5] Lineage push ──── sends edges to OpenMetadata via PUT /api/v1/lineage
+                         with column-level detail
+```
+
+### Where do table/column names come from?
+
+**All table and column names come from SQLFlow, not from the sidecar.** The sidecar sends your raw SQL text to the SQLFlow API, and SQLFlow's parser identifies every table reference, column reference, and data-flow relationship in the SQL. The sidecar then maps those names to OpenMetadata entities.
+
+For example, given this SQL:
+
+```sql
+CREATE VIEW [ReportDB].[dbo].[vw_CustomerOrders] AS
+SELECT [SalesDB].[dbo].[Customers].[CustomerID],
+       [SalesDB].[dbo].[Orders].[OrderDate]
+FROM [SalesDB].[dbo].[Customers]
+JOIN [SalesDB].[dbo].[Orders] ON ...
+```
+
+SQLFlow returns relationships like:
+- `SALESDB.DBO.CUSTOMERS.CUSTOMERID` → `REPORTDB.DBO.VW_CUSTOMERORDERS.CUSTOMERID`
+- `SALESDB.DBO.ORDERS.ORDERDATE` → `REPORTDB.DBO.VW_CUSTOMERORDERS.ORDERDATE`
+
+The sidecar reads these and builds the lineage edges.
+
+### What happens when tables don't exist in OpenMetadata?
+
+**Tables must already exist in OpenMetadata before you run the sidecar.** The sidecar only creates lineage edges between existing entities — it does not create tables, databases, or schemas.
+
+If a table referenced in the SQL is not found in OpenMetadata:
+
+- The sidecar logs a warning: `Skipping lineage: upstream table not found: mssql.salesdb.dbo.customers`
+- That specific lineage edge is skipped
+- Other edges (where both sides exist) are still emitted
+
+This means you need to either:
+1. Run OpenMetadata's metadata ingestion first (so tables are registered), or
+2. Create the table entities manually via the OpenMetadata API or UI
+
+### Case-insensitive entity matching
+
+SQLFlow uppercases identifiers for case-insensitive databases (MSSQL, etc.), but OpenMetadata may store them in mixed case (e.g. `Customers` not `CUSTOMERS`). The sidecar handles this automatically:
+
+1. First tries an exact FQN lookup: `GET /api/v1/tables/name/mssql.salesdb.dbo.customers`
+2. If that returns 404, falls back to OpenMetadata's search API with case-insensitive matching
+3. Picks the best match (exact case-insensitive FQN match wins)
 
 ## Backend modes
 
@@ -113,18 +175,44 @@ gsp-openmetadata-sidecar --mode local_jar --jar-path /path/to/gsqlparser-shaded.
   --sql-file proc.sql --dry-run
 ```
 
-## FQN resolution
+## FQN resolution and default database/schema
 
-OpenMetadata identifies tables by fully-qualified names (FQNs) in the format `service.database.schema.table`. The sidecar builds FQNs from SQLFlow's output using the defaults you provide:
+OpenMetadata identifies tables by fully-qualified names (FQNs) in the format `service.database.schema.table`. The sidecar builds FQNs from SQLFlow's output using the defaults you provide.
 
-| SQL reference | Config needed | Resolved FQN |
+### How defaults work
+
+When SQL references a table without a full `database.schema.table` path, SQLFlow returns only the parts present in the SQL. The sidecar fills in the missing parts from your `--database-name` and `--schema-name` settings:
+
+| Parts in SQL | SQLFlow returns | Sidecar fills in from defaults |
+|---|---|---|
+| `customers` (1-part) | `CUSTOMERS` | database from `--database-name`, schema from `--schema-name` |
+| `dbo.customers` (2-part) | `DBO.CUSTOMERS` | database from `--database-name` |
+| `SalesDB.dbo.customers` (3-part) | `SALESDB.DBO.CUSTOMERS` | nothing — all parts present |
+
+**Important: `--database-name` and `--schema-name` are NOT sent to SQLFlow.** They are used only on the sidecar side for FQN assembly. SQLFlow receives only the raw SQL text and the `--db-vendor` dialect flag. SQLFlow's parser extracts whatever table names appear in the SQL as-is.
+
+### Defaults
+
+| Setting | Default | When used |
+|---|---|---|
+| `--service-name` | `mssql` | Always prepended as the first FQN segment |
+| `--database-name` | *(none)* | Used when SQL has 1-part or 2-part table names |
+| `--schema-name` | `dbo` | Used when SQL has 1-part table names |
+
+### Examples
+
+| SQL reference | Config | Resolved FQN |
 |---|---|---|
 | `customers` | `--service-name mssql --database-name SalesDB --schema-name dbo` | `mssql.salesdb.dbo.customers` |
 | `dbo.customers` | `--service-name mssql --database-name SalesDB` | `mssql.salesdb.dbo.customers` |
 | `SalesDB.dbo.customers` | `--service-name mssql` | `mssql.salesdb.dbo.customers` |
 | `[Sales].[dbo].[Invoices]` | `--service-name mssql` | `mssql.sales.dbo.invoices` |
 
-Square brackets, backticks, and quotes are automatically stripped.
+Square brackets, backticks, and quotes are automatically stripped. All table/database/schema names from SQL are lowercased during FQN construction (with case-insensitive search fallback for OpenMetadata lookup).
+
+### When to set `--database-name`
+
+If your SQL uses fully-qualified names like `[SalesDB].[dbo].[Customers]`, you don't need `--database-name` — the database is already in the SQL. But if your SQL uses short names like `SELECT * FROM Customers`, you must provide `--database-name` so the sidecar knows which database to look up in OpenMetadata.
 
 ## Configuration
 

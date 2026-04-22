@@ -33,6 +33,7 @@ POWERQUERY_VENDOR_ALIASES = {"powerquery", "m", "powerbi", "dbvpowerquery"}
 # emitted as lineage endpoints themselves.
 INTERMEDIATE_PREFIXES = (
     "RS-", "RESULT_OF_",
+    "INSERT-SELECT-",
     "MERGE-INSERT-", "MERGE-UPDATE-", "MERGE-DELETE-", "MERGE-WHEN-",
 )
 
@@ -69,12 +70,17 @@ class TableLineage:
 def _is_intermediate(name: str, function_names: set[str] | None = None) -> bool:
     """Check if a name refers to an intermediate result set rather than a real table.
 
-    Intermediate means: RS-*/RESULT_OF_* result sets, or function nodes
-    (e.g. ARRAY_AGG, COUNT) that appear as parents in the relationship chain
-    but are not real tables.
+    Intermediate means: RS-*/RESULT_OF_* result sets, MSSQL temp tables (#name),
+    or function nodes (e.g. ARRAY_AGG, COUNT) that appear as parents in the
+    relationship chain but are not real tables.
     """
     upper = name.upper()
     if any(upper.startswith(p) for p in INTERMEDIATE_PREFIXES):
+        return True
+    # MSSQL temp tables (#name) are intermediates — they don't exist in
+    # OpenMetadata so lineage through them must be resolved transitively.
+    bare = name.split(".")[-1]
+    if bare.startswith("#"):
         return True
     if function_names and upper in function_names:
         return True

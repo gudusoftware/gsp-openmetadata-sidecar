@@ -38,18 +38,22 @@ class OpenMetadataClient:
           - "TABLE"             (1-part)
 
         We fill in missing parts from config defaults.
+        Parts from config (service, database, schema) preserve their original case.
+        Parts extracted from SQLFlow output are lowercased because SQLFlow
+        uppercases identifiers for case-insensitive databases like MSSQL, while
+        OpenMetadata typically stores them in lowercase.
         """
         parts = [p.strip().strip("[]\"'`") for p in table_name.split(".")]
 
         if len(parts) >= 3:
-            db, schema, table = parts[-3], parts[-2], parts[-1]
+            db, schema, table = parts[-3].lower(), parts[-2].lower(), parts[-1].lower()
         elif len(parts) == 2:
             db = self.database_name or ""
-            schema, table = parts[-2], parts[-1]
+            schema, table = parts[-2].lower(), parts[-1].lower()
         else:
             db = self.database_name or ""
             schema = self.schema_name
-            table = parts[0]
+            table = parts[0].lower()
 
         # Build FQN: service.database.schema.table
         fqn_parts = [self.service_name]
@@ -58,26 +62,70 @@ class OpenMetadataClient:
         fqn_parts.append(schema)
         fqn_parts.append(table)
 
-        return ".".join(p.lower() for p in fqn_parts)
+        return ".".join(fqn_parts)
 
     def lookup_table(self, fqn: str) -> Optional[dict[str, Any]]:
         """Look up a table entity in OpenMetadata by FQN.
 
+        Tries an exact FQN lookup first. If that returns 404 (common when
+        SQLFlow uppercases identifiers but OM stores mixed-case names), falls
+        back to the search API which is case-insensitive.
+
         Returns the entity dict (with 'id', 'name', etc.) or None if not found.
         """
-        url = f"{self.base_url}/v1/tables/name/{fqn}"
+        url = f"{self.base_url}/v1/tables/name/{fqn}?fields=columns"
         try:
             resp = requests.get(url, headers=self._headers(), timeout=30)
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 404:
-                logger.warning("Table not found in OpenMetadata: %s", fqn)
-                return None
+                # Fall back to case-insensitive search
+                return self._search_table(fqn)
             logger.warning("Unexpected status %d looking up %s: %s",
                           resp.status_code, fqn, resp.text[:200])
             return None
         except requests.RequestException as e:
             logger.error("Failed to lookup table %s: %s", fqn, e)
+            return None
+
+    def _search_table(self, fqn: str) -> Optional[dict[str, Any]]:
+        """Case-insensitive table lookup via the OpenMetadata search API.
+
+        When multiple hits match (e.g. both ``Customers`` and ``customers``
+        exist), prefer the one whose FQN matches the query case-insensitively
+        on each dotted segment, then fall back to the first hit.
+        """
+        url = (f"{self.base_url}/v1/search/query"
+               f"?q=fullyQualifiedName:{fqn}&index=table_search_index&size=10")
+        try:
+            resp = requests.get(url, headers=self._headers(), timeout=30)
+            if resp.status_code != 200:
+                logger.warning("Table not found in OpenMetadata: %s", fqn)
+                return None
+            hits = resp.json().get("hits", {}).get("hits", [])
+            if not hits:
+                logger.warning("Table not found in OpenMetadata: %s", fqn)
+                return None
+
+            # Pick best match: exact FQN match (case-insensitive) wins.
+            # Among ties, prefer the one whose table-name segment preserves
+            # more of the original casing from the query.
+            fqn_lower = fqn.lower()
+            best = None
+            for hit in hits:
+                source = hit["_source"]
+                hit_fqn = source.get("fullyQualifiedName", "")
+                if hit_fqn.lower() == fqn_lower:
+                    best = source
+                    break  # exact case-insensitive match
+            if best is None:
+                best = hits[0]["_source"]
+
+            logger.debug("Resolved %s to %s via search", fqn,
+                        best.get("fullyQualifiedName"))
+            return best
+        except (requests.RequestException, KeyError, IndexError) as e:
+            logger.warning("Search fallback failed for %s: %s", fqn, e)
             return None
 
     def add_lineage(self, payload: dict) -> bool:
@@ -178,11 +226,15 @@ def emit_lineage(
             skipped += 1
             continue
 
-        # Build column lineage
+        # Build column lineage using canonical FQNs from OpenMetadata
+        # (the entity lookup may have resolved case differences)
+        canonical_up = upstream_entity.get("fullyQualifiedName", upstream_fqn)
+        canonical_down = downstream_entity.get("fullyQualifiedName", downstream_fqn)
         col_lineage = None
         if config.column_lineage and tl.column_mappings:
             col_lineage = _build_column_lineage(
-                tl.column_mappings, upstream_fqn, downstream_fqn
+                tl.column_mappings, canonical_up, canonical_down,
+                upstream_entity, downstream_entity,
             )
 
         payload = build_lineage_payload(
@@ -202,25 +254,48 @@ def emit_lineage(
     return emitted
 
 
+def _build_column_name_map(entity: dict) -> dict[str, str]:
+    """Build a lowercase->canonical column name map from an OM entity.
+
+    Returns e.g. {"invoicedate": "InvoiceDate", "customerid": "CustomerId"}.
+    """
+    result: dict[str, str] = {}
+    for col in entity.get("columns", []):
+        name = col.get("name", "")
+        result[name.lower()] = name
+    return result
+
+
 def _build_column_lineage(
     column_mappings: list[tuple[str, str]],
     upstream_fqn: str,
     downstream_fqn: str,
+    upstream_entity: Optional[dict] = None,
+    downstream_entity: Optional[dict] = None,
 ) -> list[dict]:
     """Build OpenMetadata columnsLineage array from column mapping pairs.
 
     OpenMetadata format:
       [{"fromColumns": ["service.db.schema.table.col"], "toColumn": "service.db.schema.table.col"}]
+
+    Column names from SQLFlow are normalized to lowercase, then resolved to
+    canonical names from the OM entity when available.
     """
+    up_cols = _build_column_name_map(upstream_entity) if upstream_entity else {}
+    down_cols = _build_column_name_map(downstream_entity) if downstream_entity else {}
+
     # Group by target column
     target_to_sources: dict[str, list[str]] = {}
     for src_col, tgt_col in column_mappings:
-        src_clean = src_col.strip().lower().strip("[]\"'`")
-        tgt_clean = tgt_col.strip().lower().strip("[]\"'`")
+        src_clean = src_col.strip().strip("[]\"'`").lower()
+        tgt_clean = tgt_col.strip().strip("[]\"'`").lower()
         if src_clean == "*" or tgt_clean == "*":
             continue
-        src_fqn = f"{upstream_fqn}.{src_clean}"
-        tgt_fqn = f"{downstream_fqn}.{tgt_clean}"
+        # Use canonical column names from OM, fall back to lowercase
+        src_canonical = up_cols.get(src_clean, src_clean)
+        tgt_canonical = down_cols.get(tgt_clean, tgt_clean)
+        src_fqn = f"{upstream_fqn}.{src_canonical}"
+        tgt_fqn = f"{downstream_fqn}.{tgt_canonical}"
         target_to_sources.setdefault(tgt_fqn, []).append(src_fqn)
 
     return [
