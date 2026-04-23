@@ -17,6 +17,109 @@ OpenMetadata uses a three-parser chain (sqlglot → sqlfluff → sqlparse via `c
 
 See [Related issues](#related-issues) for upstream tickets.
 
+## OpenMetadata primer (for first-time users)
+
+If you've never used OpenMetadata before, this section gives you the vocabulary the rest of this README assumes. Skim it before you start passing flags like `--service-name` or `--om-token` — most first-time friction with lineage comes from misunderstanding how OpenMetadata identifies tables, not from bugs in this sidecar.
+
+### The entity hierarchy
+
+OpenMetadata stores metadata as **entities**. Every table, column, dashboard, pipeline, and user is an entity. For SQL lineage you care about three entity types, arranged as a strict 4-level hierarchy:
+
+```
+Database Service   (e.g. "mssql_prod")      — a connection to a source system
+    └── Database   (e.g. "SalesDB")         — a logical database within that service
+        └── Schema (e.g. "dbo")             — a schema/namespace within the database
+            └── Table (e.g. "Customers")    — the actual table (with columns inside)
+```
+
+Key points for newcomers:
+
+- **Service is not the server.** A service is an OpenMetadata-registered connection. You choose the name when you set it up in the OM UI (Settings → Services → Databases → Add). It is *usually* named after the source system (e.g. `mssql_prod`, `snowflake_analytics`), but it is an opaque identifier — not the SQL Server hostname or DSN.
+- **Database ≠ schema.** For MSSQL, `SalesDB.dbo.Customers` has database `SalesDB` and schema `dbo`. For PostgreSQL or Snowflake, same structure. For MySQL there's effectively no separate schema level, so OM stores a synthetic schema called `default`.
+- **Columns live inside the table entity**, not as standalone entities with their own URLs. Column lineage is expressed *within* a table-to-table lineage edge.
+
+### Fully-Qualified Name (FQN)
+
+An FQN is how OpenMetadata uniquely identifies an entity across the whole catalog. For tables the shape is:
+
+```
+service.database.schema.table
+```
+
+Concrete example:
+
+```
+mssql_prod.SalesDB.dbo.Customers
+```
+
+Things worth knowing up front:
+
+- **FQNs are case-preserving but the API lookup is case-sensitive by default.** `mssql_prod.SalesDB.dbo.Customers` and `mssql_prod.salesdb.dbo.customers` are treated as different FQNs by the direct lookup endpoint `GET /api/v1/tables/name/{fqn}`. This sidecar handles that by falling back to a case-insensitive search — but it's still the single biggest source of "why can't it find my table?" confusion.
+- **Segments containing dots or special characters are quoted.** `mssql_prod."My.Database".dbo."Order Details"` is a valid FQN. The sidecar does not currently emit quoted segments, so avoid dots in names if you can.
+- **The service segment is chosen by whoever registered the service**, not derived from the SQL. This is why the sidecar needs `--service-name` — SQLFlow can tell you the SQL said `SalesDB.dbo.Customers`, but only you know that `SalesDB` sits under the OM service named `mssql_prod`.
+
+### Ingestion vs lineage
+
+OpenMetadata distinguishes two kinds of metadata:
+
+1. **Structural ingestion** — creates the table entities themselves by inspecting the source system's information_schema (or equivalent). Usually runs on a schedule as an Airflow DAG or as the OM Ingestion container. Produces rows in `tables`, `databases`, `schemas`, etc.
+2. **Lineage ingestion** — creates directed edges *between* existing table entities. Produces rows in `entity_relationship` with relation type `upstream`.
+
+**Lineage ingestion does NOT create tables.** If `SalesDB.dbo.Customers` doesn't already exist as a table entity, you cannot attach lineage to it. This sidecar does lineage ingestion only — you must run structural ingestion first (or create tables via the API / UI).
+
+When the sidecar logs `Skipping lineage: upstream table not found: mssql.salesdb.dbo.customers`, it means: "I asked OM for that FQN and got a 404 (even after case-insensitive fallback). The SQL references a table that OM doesn't know about yet."
+
+### Table-level vs column-level lineage
+
+- **Table-level lineage** — a directed edge between two table entities. Answers *"does data flow from A to B?"*. Persisted as a single row per edge.
+- **Column-level lineage** — on top of the table edge, a list of column mappings: *"column `A.orderId` feeds column `B.orderId`, and columns `A.firstName + A.lastName` feed column `B.fullName`"*. Persisted inside the edge's `lineageDetails.columnsLineage` JSON field.
+
+OpenMetadata's UI renders column lineage as thin lines between column pills inside each table card. You only get those lines if the sidecar populated `columnsLineage`. Turn it off with `--no-column-lineage` if you only want table-level arrows.
+
+### Authentication: Bots and JWT tokens
+
+OpenMetadata's REST API uses bearer-token auth. For automated tools (like this sidecar), the recommended pattern is:
+
+1. In the OM UI: **Settings → Bots → Add new bot** (e.g. `lineage-sidecar-bot`).
+2. Generate a JWT token for that bot. Copy it immediately — OM only shows it once.
+3. Pass it to the sidecar via `--om-token` or the `GSP_OM_TOKEN` env var.
+
+Bot tokens are long-lived by default (OM rotates them only when you regenerate). Treat them like passwords. The token carries the bot's role — make sure the bot has the `DataConsumer` role plus `EditLineage` permission, otherwise the `PUT /api/v1/lineage` call will return 403.
+
+### The lineage API this sidecar uses
+
+The sidecar pushes edges via:
+
+```
+PUT /api/v1/lineage
+{
+  "edge": {
+    "fromEntity": { "id": "<upstream-uuid>",   "type": "table" },
+    "toEntity":   { "id": "<downstream-uuid>", "type": "table" },
+    "lineageDetails": {
+      "sqlQuery": "CREATE PROC ...",
+      "source":   "QueryLineage",
+      "columnsLineage": [ { "fromColumns": [...], "toColumn": "..." } ]
+    }
+  }
+}
+```
+
+Note that both sides are identified by **entity UUID**, not FQN. The sidecar resolves FQN → UUID itself (step [4] in the pipeline diagram below). That lookup is where FQN correctness pays off: a wrong FQN means a 404 means a skipped edge.
+
+### How these concepts map to sidecar flags
+
+| OM concept | Sidecar flag | Notes |
+|---|---|---|
+| Database service name | `--service-name` | First FQN segment. Default: `mssql`. |
+| Database | `--database-name` | Fills FQN when SQL has 1- or 2-part names. No default. |
+| Schema | `--schema-name` | Fills FQN when SQL has 1-part names. Default: `dbo`. |
+| OM server URL | `--om-server` | E.g. `http://localhost:8585/api` (note the `/api` suffix). |
+| Bot JWT token | `--om-token` | From Settings → Bots. |
+| Column lineage toggle | `--column-lineage` / `--no-column-lineage` | Default: on. |
+
+With that vocabulary in hand, the rest of this README should read without surprises.
+
 ## Requirements
 
 - Python 3.9+
