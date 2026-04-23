@@ -8,7 +8,8 @@ import sys
 from . import __version__
 from .backend import RateLimitError, SQLFlowError, create_backend
 from .config import load_config
-from .emitter import emit_lineage
+from .emitter import FatalRunError, emit_lineage
+from .entity_planner import CapExceededError, ForeignServiceError
 from .lineage_mapper import extract_lineage
 from .sql_input import parse_sql_file, parse_sql_text
 
@@ -85,6 +86,21 @@ def main():
         help="SQL dialect (default: dbvmssql).",
     )
     parser.add_argument(
+        "--default-server",
+        help="Default SQL server name SQLFlow uses to qualify 4-part MSSQL references. "
+             "Independent from --service-name (which is an OM identifier).",
+    )
+    parser.add_argument(
+        "--default-database",
+        help="Default database name SQLFlow uses to qualify 1- and 2-part references. "
+             "Independent from --database-name (which fills OM FQN on the sidecar side).",
+    )
+    parser.add_argument(
+        "--default-schema",
+        help="Default schema name SQLFlow uses to qualify 1-part references. "
+             "Independent from --schema-name (which fills OM FQN on the sidecar side).",
+    )
+    parser.add_argument(
         "--jar-path",
         help="Path to a licensed gsqlparser-*-shaded.jar (for --mode local_jar).",
     )
@@ -134,6 +150,35 @@ def main():
         dest="column_lineage",
         help="Emit table-level lineage only.",
     )
+
+    auto_create_group = parser.add_mutually_exclusive_group()
+    auto_create_group.add_argument(
+        "--auto-create-entities",
+        dest="auto_create_entities",
+        action="store_true",
+        default=None,
+        help="Opt in to creating missing Database/Schema/Table entities in "
+             "OpenMetadata before emitting lineage (never creates DatabaseService).",
+    )
+    auto_create_group.add_argument(
+        "--no-auto-create-entities",
+        dest="auto_create_entities",
+        action="store_false",
+        help="Disable auto-creation (default).",
+    )
+    parser.add_argument(
+        "--on-create-failure",
+        choices=["abort", "skip-edge"],
+        default=None,
+        help="Policy when an entity create fails after preflight (default: abort).",
+    )
+    parser.add_argument(
+        "--max-entities-to-create",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Abort if the plan would create more than N entities (default: 100).",
+    )
     parser.add_argument(
         "--json",
         action="store_true",
@@ -169,6 +214,12 @@ def main():
         config.sqlflow.secret_key = args.secret_key
     if args.db_vendor:
         config.sqlflow.db_vendor = args.db_vendor
+    if args.default_server:
+        config.sqlflow.default_server = args.default_server
+    if args.default_database:
+        config.sqlflow.default_database = args.default_database
+    if args.default_schema:
+        config.sqlflow.default_schema = args.default_schema
     if args.jar_path:
         config.sqlflow.jar_path = args.jar_path
     if args.java_bin:
@@ -185,10 +236,42 @@ def main():
         config.openmetadata.schema_name = args.schema_name
     if args.column_lineage is not None:
         config.openmetadata.column_lineage = args.column_lineage
+    if args.auto_create_entities is not None:
+        config.openmetadata.auto_create_entities = args.auto_create_entities
+    if args.on_create_failure is not None:
+        config.openmetadata.on_create_failure = args.on_create_failure
+    if args.max_entities_to_create is not None:
+        config.openmetadata.max_entities_to_create = args.max_entities_to_create
     if args.sql_file:
         config.input.sql_file = args.sql_file
     if args.sql:
         config.input.sql_text = args.sql
+
+    # CLI overrides may have toggled the feature; re-validate the combined
+    # config before we hit the network.
+    if config.openmetadata.auto_create_entities:
+        if config.openmetadata.on_create_failure not in {"abort", "skip-edge"}:
+            logger.error(
+                "--on-create-failure must be 'abort' or 'skip-edge', got %r",
+                config.openmetadata.on_create_failure,
+            )
+            sys.exit(1)
+        if config.openmetadata.max_entities_to_create < 0:
+            logger.error("--max-entities-to-create must be non-negative")
+            sys.exit(1)
+        has_db_default = bool(
+            config.sqlflow.default_database or config.openmetadata.database_name
+        )
+        has_schema_default = bool(
+            config.sqlflow.default_schema or config.openmetadata.schema_name
+        )
+        if not has_db_default or not has_schema_default:
+            logger.error(
+                "--auto-create-entities requires a default database and schema "
+                "(set sqlflow.default_database / sqlflow.default_schema or "
+                "openmetadata.database_name / openmetadata.schema_name)."
+            )
+            sys.exit(1)
 
     # --- Determine input source ---
     if config.input.sql_text:
@@ -229,6 +312,9 @@ def main():
                 sql=stmt.sql,
                 db_vendor=config.sqlflow.db_vendor,
                 show_relation_type=config.sqlflow.show_relation_type,
+                default_server=config.sqlflow.default_server,
+                default_database=config.sqlflow.default_database,
+                default_schema=config.sqlflow.default_schema,
             )
 
             if args.output_json:
@@ -282,20 +368,53 @@ def main():
     # Combine all SQL for the query field
     all_sql = "\n;\n".join(stmt.sql for stmt in statements)
 
-    emitted = emit_lineage(
-        all_lineages,
-        sql_query=all_sql,
-        config=config.openmetadata,
-        dry_run=args.dry_run,
-    )
+    try:
+        summary = emit_lineage(
+            all_lineages,
+            sql_query=all_sql,
+            config=config.openmetadata,
+            dry_run=args.dry_run,
+        )
+    except (FatalRunError, ForeignServiceError, CapExceededError) as e:
+        logger.error("%s", e)
+        sys.exit(1)
+
+    if config.openmetadata.auto_create_entities:
+        logger.info("--- Entity materialization ---")
+        logger.info("Databases:        created=%d existing=%d failed=%d",
+                    summary.created_databases, summary.existing_databases,
+                    sum(1 for fqn, _ in summary.failed_entities
+                        if fqn.count(".") == 1))
+        logger.info("DatabaseSchemas:  created=%d existing=%d failed=%d",
+                    summary.created_schemas, summary.existing_schemas,
+                    sum(1 for fqn, _ in summary.failed_entities
+                        if fqn.count(".") == 2))
+        logger.info("Tables:           created=%d existing=%d failed=%d unresolvable=%d",
+                    summary.created_tables, summary.existing_tables,
+                    sum(1 for fqn, _ in summary.failed_entities
+                        if fqn.count(".") == 3),
+                    len(summary.unresolvable_fqns))
+        logger.info("--- Lineage emission ---")
+        logger.info("Emitted:                     %d", summary.emitted_edges)
+        logger.info("Skipped (entity-missing):    %d", summary.skipped_edges)
+        logger.info("Column lineage suppressed:   %d",
+                    summary.column_lineage_suppressed_edges)
+        if summary.column_pairs_filtered:
+            logger.info("Column pairs filtered:       %d",
+                        summary.column_pairs_filtered)
+        if summary.tag_apply_failures:
+            logger.info("Tag-apply failures:          %d",
+                        summary.tag_apply_failures)
+        for u in summary.unresolvable_fqns:
+            logger.warning("Unresolvable FQN: %s (%s)", u.fqn, u.reason)
 
     if args.dry_run:
         logger.info("[DRY RUN] Would have emitted %d lineage edges. "
                     "Remove --dry-run to push to OpenMetadata at %s",
-                    emitted, config.openmetadata.server)
+                    summary.emitted_edges, config.openmetadata.server)
     else:
         logger.info("Done. Emitted %d lineage edges to %s",
-                    emitted, config.openmetadata.server)
+                    summary.emitted_edges, config.openmetadata.server)
 
     sys.exit(0 if errors == 0 else 1)
 

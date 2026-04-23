@@ -24,6 +24,11 @@ class SQLFlowConfig:
     secret_key: Optional[str] = None
     db_vendor: str = "dbvmssql"
     show_relation_type: str = "fdd"
+    # Parse-time default qualifiers sent to SQLFlow. Independent from the
+    # openmetadata.* defaults below.
+    default_server: Optional[str] = None
+    default_database: Optional[str] = None
+    default_schema: Optional[str] = None
     # local_jar mode only:
     jar_path: Optional[str] = None
     java_bin: str = "java"
@@ -43,6 +48,13 @@ class OpenMetadataConfig:
     database_name: Optional[str] = None
     schema_name: str = "dbo"
     column_lineage: bool = True
+    # Opt-in auto-creation of missing Database / DatabaseSchema / Table
+    # entities before lineage emission. Default off preserves byte-for-byte
+    # legacy behavior.
+    auto_create_entities: bool = False
+    on_create_failure: str = "abort"          # {"abort", "skip-edge"}
+    max_entities_to_create: int = 100
+    auto_created_tag_fqn: Optional[str] = None  # e.g. "AutoCreated.gsp-sidecar"
 
 
 @dataclass
@@ -80,6 +92,9 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
         cfg.sqlflow.secret_key = sf.get("secret_key", cfg.sqlflow.secret_key)
         cfg.sqlflow.db_vendor = sf.get("db_vendor", cfg.sqlflow.db_vendor)
         cfg.sqlflow.show_relation_type = sf.get("show_relation_type", cfg.sqlflow.show_relation_type)
+        cfg.sqlflow.default_server = sf.get("default_server", cfg.sqlflow.default_server)
+        cfg.sqlflow.default_database = sf.get("default_database", cfg.sqlflow.default_database)
+        cfg.sqlflow.default_schema = sf.get("default_schema", cfg.sqlflow.default_schema)
         cfg.sqlflow.jar_path = sf.get("jar_path", cfg.sqlflow.jar_path)
         cfg.sqlflow.java_bin = sf.get("java_bin", cfg.sqlflow.java_bin)
 
@@ -91,6 +106,14 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
         cfg.openmetadata.schema_name = om.get("schema_name", cfg.openmetadata.schema_name)
         if "column_lineage" in om:
             cfg.openmetadata.column_lineage = bool(om["column_lineage"])
+        if "auto_create_entities" in om:
+            cfg.openmetadata.auto_create_entities = bool(om["auto_create_entities"])
+        if "on_create_failure" in om:
+            cfg.openmetadata.on_create_failure = str(om["on_create_failure"])
+        if "max_entities_to_create" in om:
+            cfg.openmetadata.max_entities_to_create = int(om["max_entities_to_create"])
+        if "auto_created_tag_fqn" in om:
+            cfg.openmetadata.auto_created_tag_fqn = om["auto_created_tag_fqn"]
 
         inp = raw.get("input", {})
         cfg.input.sql_file = inp.get("sql_file", cfg.input.sql_file)
@@ -103,6 +126,9 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
         "GSP_SQLFLOW_USER_ID": ("sqlflow", "user_id"),
         "GSP_SQLFLOW_SECRET_KEY": ("sqlflow", "secret_key"),
         "GSP_DB_VENDOR": ("sqlflow", "db_vendor"),
+        "GSP_DEFAULT_SERVER": ("sqlflow", "default_server"),
+        "GSP_DEFAULT_DATABASE": ("sqlflow", "default_database"),
+        "GSP_DEFAULT_SCHEMA": ("sqlflow", "default_schema"),
         "GSP_JAR_PATH": ("sqlflow", "jar_path"),
         "GSP_JAVA_BIN": ("sqlflow", "java_bin"),
         "GSP_OM_SERVER": ("openmetadata", "server"),
@@ -111,6 +137,10 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
         "GSP_OM_DATABASE_NAME": ("openmetadata", "database_name"),
         "GSP_OM_SCHEMA_NAME": ("openmetadata", "schema_name"),
         "GSP_COLUMN_LINEAGE": ("openmetadata", "column_lineage"),
+        "GSP_OM_AUTO_CREATE_ENTITIES": ("openmetadata", "auto_create_entities"),
+        "GSP_OM_ON_CREATE_FAILURE": ("openmetadata", "on_create_failure"),
+        "GSP_OM_MAX_ENTITIES_TO_CREATE": ("openmetadata", "max_entities_to_create"),
+        "GSP_OM_AUTO_CREATED_TAG_FQN": ("openmetadata", "auto_created_tag_fqn"),
         "GSP_SQL_FILE": ("input", "sql_file"),
         "GSP_SQL_TEXT": ("input", "sql_text"),
     }
@@ -120,6 +150,13 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
             current = getattr(getattr(cfg, section), attr, None)
             if isinstance(current, bool):
                 val = val.strip().lower() in ("1", "true", "yes", "on")
+            elif isinstance(current, int) and not isinstance(current, bool):
+                try:
+                    val = int(val)
+                except ValueError:
+                    raise ValueError(
+                        f"Environment variable {env_var} must be an integer, got {val!r}"
+                    )
             setattr(getattr(cfg, section), attr, val)
 
     # --- Validate ---
@@ -141,5 +178,29 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
         raise ValueError(
             "sqlflow.jar_path is required when mode is 'local_jar'."
         )
+
+    if cfg.openmetadata.auto_create_entities:
+        if cfg.openmetadata.on_create_failure not in {"abort", "skip-edge"}:
+            raise ValueError(
+                f"openmetadata.on_create_failure must be 'abort' or 'skip-edge', "
+                f"got {cfg.openmetadata.on_create_failure!r}."
+            )
+        if cfg.openmetadata.max_entities_to_create < 0:
+            raise ValueError(
+                "openmetadata.max_entities_to_create must be non-negative."
+            )
+        has_db_default = bool(
+            cfg.sqlflow.default_database or cfg.openmetadata.database_name
+        )
+        has_schema_default = bool(
+            cfg.sqlflow.default_schema or cfg.openmetadata.schema_name
+        )
+        if not has_db_default or not has_schema_default:
+            raise ValueError(
+                "openmetadata.auto_create_entities=true requires "
+                "sqlflow.default_database (or openmetadata.database_name) AND "
+                "sqlflow.default_schema (or openmetadata.schema_name) to "
+                "prevent partial-FQN ghost entities."
+            )
 
     return cfg

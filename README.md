@@ -2,7 +2,43 @@
 
 Recover SQL lineage that OpenMetadata's parser silently drops — MSSQL stored procedures, BigQuery procedural SQL, MERGE column lineage, temp-table hops, and [20+ dialects](https://www.gudusoft.com/sql-dialects/) — using [Gudu SQLFlow](https://sqlflow.gudusoft.com), then push the recovered lineage back to OpenMetadata via `PUT /api/v1/lineage`.
 
+Optionally, [auto-create](#auto-create-missing-entities-opt-in) any missing `Database` / `DatabaseSchema` / `Table` entities before emitting lineage, so SQL referencing not-yet-ingested tables still produces complete graphs.
+
 No changes to OpenMetadata code. Public REST API only.
+
+## Quick start
+
+```bash
+pip install gsp-openmetadata-sidecar
+gsp-openmetadata-sidecar --dry-run --sql "CREATE PROC p AS BEGIN INSERT INTO t2 SELECT a, b FROM t1 END"
+```
+
+This command:
+
+- parses the SQL with SQLFlow's free anonymous tier
+- prints the extracted lineage edges (`t1 → t2`) to stdout
+- does not contact OpenMetadata
+- does not require `sidecar.yaml` — if the file is absent, built-in defaults are used
+
+If you see upstream → downstream edges, the tool works in your environment. For more realistic fixtures — MSSQL stored procedures, BigQuery procedural SQL, MERGE column lineage — see [`examples/`](examples/) in the repo:
+
+```bash
+gsp-openmetadata-sidecar --sql-file examples/mssql_stored_procedure.sql --dry-run
+```
+
+Everything below is about graduating from that first `--dry-run` to a useful live deployment.
+
+## Choose your path
+
+The sidecar has three onboarding paths with different prerequisites. Pick the row that matches your goal:
+
+| Goal | What you need | Shortest command |
+|---|---|---|
+| Evaluate lineage extraction | A SQL file or inline SQL | `gsp-openmetadata-sidecar --sql-file proc.sql --dry-run` |
+| Push lineage to an existing OM catalog | Above + `--om-server`, `--om-token`, `--service-name` (+ `--database-name` if SQL uses short names) | See [Push lineage to OpenMetadata](#push-lineage-to-openmetadata) |
+| Push lineage and auto-create missing tables | Above + `--default-database`/`--default-schema` + bot with `Create` RBAC | See [Auto-create missing entities](#auto-create-missing-entities-opt-in) |
+
+If you're new to OpenMetadata, you will also want to skim the [OpenMetadata primer](#openmetadata-primer-for-first-time-users) once — most first-time friction comes from misunderstanding how OpenMetadata identifies tables, not from bugs in this sidecar.
 
 ## When to use this
 
@@ -14,12 +50,220 @@ OpenMetadata uses a three-parser chain (sqlglot → sqlfluff → sqlparse via `c
 - Multi-statement scripts (`DECLARE`, `IF/THEN`, `CREATE TEMP TABLE`)
 - `MERGE INTO … WHEN MATCHED … WHEN NOT MATCHED` column lineage
 - Cross-database MSSQL queries
+- Lineage against tables that don't exist in OpenMetadata yet (staging, ephemeral, not-yet-ingested sources)
 
 See [Related issues](#related-issues) for upstream tickets.
 
+## Install
+
+From PyPI:
+
+```bash
+pip install gsp-openmetadata-sidecar
+```
+
+From source (recommended for contributors and environments with an externally managed Python):
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+gsp-openmetadata-sidecar --help
+```
+
+Requirements:
+
+- Python 3.9+
+- Network access to the SQLFlow API (for `anonymous`, `authenticated`, `self_hosted` modes)
+- Java 8+ and a licensed `gsqlparser-*-shaded.jar` (for `local_jar` mode only)
+
+## Push lineage to OpenMetadata
+
+To push lineage (instead of dry-running), you need:
+
+1. An OpenMetadata instance with the target tables already ingested — or [`--auto-create-entities`](#auto-create-missing-entities-opt-in) enabled
+2. A JWT token (Settings → Bots in the OpenMetadata UI)
+3. The database service name as registered in OpenMetadata
+
+```bash
+gsp-openmetadata-sidecar \
+  --sql-file stored_proc.sql \
+  --om-server http://localhost:8585/api \
+  --om-token "eyJ..." \
+  --service-name mssql_prod \
+  --database-name SalesDB \
+  --schema-name dbo
+```
+
+Or via a config file. A minimal `sidecar.yaml` for a live run:
+
+```yaml
+sqlflow:
+  mode: anonymous
+  db_vendor: dbvmssql
+
+openmetadata:
+  server: http://localhost:8585/api
+  token: "eyJ..."
+  service_name: mssql_prod
+  database_name: SalesDB
+  schema_name: dbo
+```
+
+```bash
+gsp-openmetadata-sidecar --config sidecar.yaml --sql-file stored_proc.sql
+```
+
+See [`examples/sidecar.yaml.example`](examples/sidecar.yaml.example) for the full annotated version, including `authenticated` / `self_hosted` / `local_jar` and auto-create knobs.
+
+### The flags you'll actually type
+
+| Flag | What it does |
+|---|---|
+| `--sql-file` / `--sql` | Input SQL. One file path, or an inline string. |
+| `--dry-run` | Skip the write to OpenMetadata; print extracted lineage instead. |
+| `--om-server` | OpenMetadata API base URL. **Must include `/api`.** |
+| `--om-token` | Bot JWT token. From Settings → Bots in the OM UI. |
+| `--service-name` | Database service name as registered in OM. First FQN segment. |
+| `--database-name` / `--schema-name` | Fallbacks for FQN assembly when SQL uses short names. |
+| `--auto-create-entities` | Opt in to creating missing `Database` / `DatabaseSchema` / `Table` before emitting. |
+
+All other flags are listed in the [Configuration reference](#configuration-reference).
+
+## Which defaults do I need?
+
+The sidecar has two separate layers of defaults with similar-looking names. Confusing them is the most common first-run mistake:
+
+| Layer | Flags | Purpose |
+|---|---|---|
+| **SQLFlow (parse-time)** | `--default-server` / `--default-database` / `--default-schema` | Help **SQLFlow understand the SQL**. Fed as request fields so `SELECT * FROM Customers` is parsed as `SalesDB.dbo.Customers` instead of a placeholder. |
+| **Sidecar (FQN-assembly)** | `--service-name` / `--database-name` / `--schema-name` | Help the sidecar **build OpenMetadata FQNs**. Fill in missing parts when SQLFlow returns fewer than 3 segments. |
+
+Rules of thumb:
+
+- If your SQL uses fully-qualified names (`[SalesDB].[dbo].[Customers]`), you need only `--service-name`.
+- If your SQL uses bare table names, set **both** pairs to the same values so SQLFlow parses correctly *and* the sidecar can build a valid 4-part FQN.
+- `--default-*` flags are ignored in `local_jar` mode (with a warning) — the JAR-based `DataFlowAnalyzer` CLI does not accept them.
+
+For the full mechanics, see [FQN resolution and default database/schema](#fqn-resolution-and-default-databaseschema) and [SQLFlow default qualifiers (parse-time)](#sqlflow-default-qualifiers-parse-time) below.
+
+## Common first-run mistakes
+
+A short list of the failure modes most new users hit:
+
+- **`--om-server` missing the `/api` suffix.** It must be `http://host:port/api`, not just `http://host:port`.
+- **Confusing `--default-database` with `--database-name`.** See the cheat-sheet above.
+- **Expecting `--dry-run` to contact OpenMetadata.** It does not. Drop `--dry-run` for a live run.
+- **Expecting `local_jar` mode to honor `--default-*`.** It doesn't — SQLFlow's JAR CLI doesn't accept those.
+- **Expecting lineage push to create tables by itself.** It doesn't. Either ingest structure first, or pass [`--auto-create-entities`](#auto-create-missing-entities-opt-in).
+- **Bot token missing `EditLineage`.** `PUT /api/v1/lineage` returns 403. Add the permission or grant the bot the `DataConsumer` role.
+
+## Common commands
+
+```bash
+# Inline SQL (no file required):
+gsp-openmetadata-sidecar --sql "CREATE PROC p AS BEGIN INSERT INTO t2 SELECT a, b FROM t1 END" --dry-run
+
+# BigQuery procedural SQL with DECLARE, CREATE TEMP TABLE:
+gsp-openmetadata-sidecar --sql-file examples/bigquery_procedural.sql --db-vendor dbvbigquery --dry-run
+
+# Table-level lineage only (skip column mappings):
+gsp-openmetadata-sidecar --sql-file proc.sql --no-column-lineage --dry-run
+
+# Print raw SQLFlow JSON response to stdout:
+gsp-openmetadata-sidecar --sql-file proc.sql --json --dry-run
+
+# Verbose/debug logging:
+gsp-openmetadata-sidecar --sql-file proc.sql --dry-run -v
+
+# Preview what entities would be auto-created (zero writes):
+gsp-openmetadata-sidecar --sql-file proc.sql --auto-create-entities --dry-run
+
+# Live run with auto-create, conservative cap, fail on any create failure:
+gsp-openmetadata-sidecar --sql-file proc.sql --auto-create-entities \
+  --max-entities-to-create 10 --on-create-failure abort
+
+# Show version:
+gsp-openmetadata-sidecar --version
+```
+
+## Auto-create missing entities (opt-in)
+
+By default, the sidecar only writes lineage *edges*. If a referenced table isn't found in OpenMetadata, it logs `Skipping lineage: upstream table not found: …`, skips that edge, and continues. This is the safe baseline.
+
+With `--auto-create-entities` (or `openmetadata.auto_create_entities: true` in YAML, or `GSP_OM_AUTO_CREATE_ENTITIES=true`), the sidecar runs a pre-pass planner, creates any missing `Database` / `DatabaseSchema` / `Table` via `POST` in strict order, and then emits the lineage. The `DatabaseService` is never auto-created.
+
+When to reach for it:
+
+- SQL references staging / ephemeral / not-yet-onboarded tables
+- You can't wait for a metadata ingestion run to populate the catalog
+- You want complete lineage graphs *now*, and are willing to accept skeletal (column-less) table entities that a connector can enrich later
+
+### Two hard prerequisites
+
+1. **Set parse-time defaults.** Auto-create refuses to run unless `--default-database` + `--default-schema` are set (or the `openmetadata.*` equivalents). Without them, SQLFlow can return partial identifiers that would otherwise materialize as ghost entities at non-4-part FQNs.
+2. **The bot needs `Create` RBAC** on `Database`, `DatabaseSchema`, and `Table`, scoped to the configured service. See the [operator guide](docs/auto-create-operator-guide.md#required-rbac) for a recommended role shape.
+
+### The minimum safe command
+
+```bash
+# 1. Dry-run to preview what would be created.
+gsp-openmetadata-sidecar \
+  --config sidecar.yaml \
+  --sql-file my_etl.sql \
+  --auto-create-entities \
+  --dry-run
+
+# 2. Live run with a conservative cap.
+gsp-openmetadata-sidecar \
+  --config sidecar.yaml \
+  --sql-file my_etl.sql \
+  --auto-create-entities \
+  --on-create-failure abort \
+  --max-entities-to-create 10
+```
+
+For safety invariants, rollout recipe, and stop-ship criteria before rolling this out on a real OpenMetadata instance, see [**`docs/auto-create-operator-guide.md`**](docs/auto-create-operator-guide.md).
+
+## Backend modes
+
+| Mode | Auth | Rate limit | Data stays… | Best for |
+|---|---|---|---|---|
+| `anonymous` (default) | None | 50/day per IP | Gudu cloud | Quick evaluation |
+| `authenticated` | `user_id` + `secret_key` | 10k/month | Gudu cloud | Regular use |
+| `self_hosted` | `user_id` + `secret_key` (token exchange) | Unlimited | Your network | Production / air-gapped |
+| `local_jar` | None (local process) | Unlimited | Your machine | Offline / no Docker |
+
+```bash
+# Anonymous (default — no signup needed):
+gsp-openmetadata-sidecar --sql-file proc.sql --dry-run
+
+# Authenticated — BOTH user_id and secret_key are required:
+GSP_BACKEND_MODE=authenticated \
+GSP_SQLFLOW_USER_ID=your-user-id \
+GSP_SQLFLOW_SECRET_KEY=your-secret-key \
+  gsp-openmetadata-sidecar --sql-file proc.sql --dry-run
+
+# Equivalent with CLI flags:
+gsp-openmetadata-sidecar --mode authenticated \
+  --user-id your-user-id --secret-key your-secret-key \
+  --sql-file proc.sql --dry-run
+
+# Self-hosted SQLFlow Docker (token-exchange protocol, same creds pattern):
+gsp-openmetadata-sidecar --mode self_hosted \
+  --sqlflow-url http://localhost:8165/api/gspLive_backend/sqlflow/generation/sqlflow/exportFullLineageAsJson \
+  --user-id gudu --secret-key 0123456789 \
+  --sql-file proc.sql --dry-run
+
+# Local JAR (no network; requires Java and a licensed JAR):
+gsp-openmetadata-sidecar --mode local_jar \
+  --jar-path /path/to/gsqlparser-shaded.jar \
+  --sql-file proc.sql --dry-run
+```
+
 ## OpenMetadata primer (for first-time users)
 
-If you've never used OpenMetadata before, this section gives you the vocabulary the rest of this README assumes. Skim it before you start passing flags like `--service-name` or `--om-token` — most first-time friction with lineage comes from misunderstanding how OpenMetadata identifies tables, not from bugs in this sidecar.
+If you've never used OpenMetadata before, this section gives you the vocabulary the rest of this README assumes. Skim it before you start passing flags like `--service-name` or `--om-token`.
 
 ### The entity hierarchy
 
@@ -65,7 +309,7 @@ OpenMetadata distinguishes two kinds of metadata:
 1. **Structural ingestion** — creates the table entities themselves by inspecting the source system's information_schema (or equivalent). Usually runs on a schedule as an Airflow DAG or as the OM Ingestion container. Produces rows in `tables`, `databases`, `schemas`, etc.
 2. **Lineage ingestion** — creates directed edges *between* existing table entities. Produces rows in `entity_relationship` with relation type `upstream`.
 
-**Lineage ingestion does NOT create tables.** If `SalesDB.dbo.Customers` doesn't already exist as a table entity, you cannot attach lineage to it. This sidecar does lineage ingestion only — you must run structural ingestion first (or create tables via the API / UI).
+By default, lineage ingestion does not create tables. This sidecar can optionally auto-create missing `Database` / `DatabaseSchema` / `Table` entities before emission (see [Auto-create missing entities](#auto-create-missing-entities-opt-in)) — but in the default mode, if `SalesDB.dbo.Customers` doesn't already exist as a table entity, you cannot attach lineage to it.
 
 When the sidecar logs `Skipping lineage: upstream table not found: mssql.salesdb.dbo.customers`, it means: "I asked OM for that FQN and got a 404 (even after case-insensitive fallback). The SQL references a table that OM doesn't know about yet."
 
@@ -118,133 +362,6 @@ Note that both sides are identified by **entity UUID**, not FQN. The sidecar res
 | Bot JWT token | `--om-token` | From Settings → Bots. |
 | Column lineage toggle | `--column-lineage` / `--no-column-lineage` | Default: on. |
 
-With that vocabulary in hand, the rest of this README should read without surprises.
-
-## Requirements
-
-- Python 3.9+
-- Network access to the SQLFlow API (for `anonymous`, `authenticated`, `self_hosted` modes)
-- Java 8+ and a licensed `gsqlparser-*-shaded.jar` (for `local_jar` mode only)
-- OpenMetadata tables must already exist if you plan to push lineage — the sidecar creates lineage edges, not tables
-
-## Install
-
-From PyPI:
-
-```bash
-pip install gsp-openmetadata-sidecar
-```
-
-From source (recommended for contributors and environments with an externally managed Python):
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
-gsp-openmetadata-sidecar --help
-```
-
-## Quick start
-
-Example SQL files are in `examples/`. The fastest verified command (anonymous mode, no signup):
-
-```bash
-gsp-openmetadata-sidecar --sql-file examples/mssql_case_sensitivity.sql --dry-run
-```
-
-This parses the file with SQLFlow, prints the extracted lineage edges, and does not call OpenMetadata (because of `--dry-run`).
-
-More examples:
-
-```bash
-# MSSQL stored procedure with BEGIN/END, temp tables, MERGE:
-gsp-openmetadata-sidecar --sql-file examples/mssql_stored_procedure.sql --dry-run
-
-# BigQuery procedural SQL with DECLARE, CREATE TEMP TABLE:
-gsp-openmetadata-sidecar --sql-file examples/bigquery_procedural.sql --db-vendor dbvbigquery --dry-run
-
-# Inline SQL:
-gsp-openmetadata-sidecar --sql "CREATE PROC p AS BEGIN INSERT INTO t2 SELECT a, b FROM t1 END" --dry-run
-```
-
-## Common commands
-
-```bash
-# Table-level lineage only (skip column mappings):
-gsp-openmetadata-sidecar --sql-file proc.sql --no-column-lineage --dry-run
-
-# Print raw SQLFlow JSON response to stdout:
-gsp-openmetadata-sidecar --sql-file proc.sql --json --dry-run
-
-# Verbose/debug logging:
-gsp-openmetadata-sidecar --sql-file proc.sql --dry-run -v
-
-# Show version:
-gsp-openmetadata-sidecar --version
-```
-
-## Push lineage to OpenMetadata
-
-To actually push lineage (not dry-run), you need:
-
-1. An OpenMetadata instance with the target tables already ingested
-2. A JWT token (Settings → Bots in the OpenMetadata UI)
-3. The database service name as registered in OpenMetadata
-
-```bash
-gsp-openmetadata-sidecar \
-  --sql-file stored_proc.sql \
-  --om-server http://localhost:8585/api \
-  --om-token "eyJ..." \
-  --service-name mssql_prod \
-  --database-name SalesDB \
-  --schema-name dbo
-```
-
-Or via a config file (see `examples/sidecar.yaml.example`):
-
-```bash
-cp examples/sidecar.yaml.example sidecar.yaml
-# Edit sidecar.yaml with your settings
-gsp-openmetadata-sidecar --config sidecar.yaml --sql-file stored_proc.sql
-```
-
-## Backend modes
-
-| Mode | Auth | Rate limit | Data stays… | Best for |
-|---|---|---|---|---|
-| `anonymous` (default) | None | 50/day per IP | Gudu cloud | Quick evaluation |
-| `authenticated` | `user_id` + `secret_key` | 10k/month | Gudu cloud | Regular use |
-| `self_hosted` | `user_id` + `secret_key` (token exchange) | Unlimited | Your network | Production / air-gapped |
-| `local_jar` | None (local process) | Unlimited | Your machine | Offline / no Docker |
-
-```bash
-# Anonymous (default — no signup needed):
-gsp-openmetadata-sidecar --sql-file proc.sql --dry-run
-
-# Authenticated — BOTH user_id and secret_key are required:
-GSP_BACKEND_MODE=authenticated \
-GSP_SQLFLOW_USER_ID=your-user-id \
-GSP_SQLFLOW_SECRET_KEY=your-secret-key \
-  gsp-openmetadata-sidecar --sql-file proc.sql --dry-run
-
-# Equivalent with CLI flags:
-gsp-openmetadata-sidecar --mode authenticated \
-  --user-id your-user-id --secret-key your-secret-key \
-  --sql-file proc.sql --dry-run
-
-# Self-hosted SQLFlow Docker (token-exchange protocol, same creds pattern):
-gsp-openmetadata-sidecar --mode self_hosted \
-  --sqlflow-url http://localhost:8165/api/gspLive_backend/sqlflow/generation/sqlflow/exportFullLineageAsJson \
-  --user-id gudu --secret-key 0123456789 \
-  --sql-file proc.sql --dry-run
-
-# Local JAR (no network; requires Java and a licensed JAR):
-gsp-openmetadata-sidecar --mode local_jar \
-  --jar-path /path/to/gsqlparser-shaded.jar \
-  --sql-file proc.sql --dry-run
-```
-
 ## How it works
 
 The sidecar is a bridge between **SQLFlow** (which understands SQL) and **OpenMetadata** (which stores metadata). SQL syntax parsing is delegated to SQLFlow — the sidecar decides how the file is chunked, maps the result to OpenMetadata entities, and pushes lineage edges.
@@ -268,13 +385,28 @@ SQL file / inline SQL
   [4] Entity lookup ─── looks up each FQN in OpenMetadata to get entity UUIDs
         |                (exact match first, then case-insensitive search fallback)
         v
+  [4b] (optional) Auto-create planner — only when --auto-create-entities is set.
+        |                Groups missing endpoints into a Database → Schema → Table
+        |                plan, enforces a safety cap, runs a preflight probe, then
+        |                POSTs each tier in strict order. Never touches existing
+        |                entities; never creates a DatabaseService.
+        v
   [5] Lineage push ──── sends edges to OpenMetadata via PUT /api/v1/lineage
-                         with column-level detail
+                         with column-level detail (suppressed on edges whose
+                         endpoints are skeletal / column-less; unknown-column
+                         pairs are filtered pre-emit).
 ```
 
 ### Where do table/column names come from?
 
-**All table and column names come from SQLFlow, not from the sidecar.** The sidecar sends your raw SQL text to SQLFlow, and SQLFlow's parser identifies every table reference, column reference, and data-flow relationship. The sidecar then maps those names to OpenMetadata entities.
+**All table and column names come from SQLFlow, not from the sidecar — and not from an LLM.** SQLFlow is a deterministic SQL parser (Gudu Soft's General SQL Parser). The sidecar's Python is a mapper/translator, not a parser.
+
+SQLFlow's JSON response has two branches the sidecar reads:
+
+- **`dbobjs`** — a tree of `servers → databases → schemas → tables[]/views[]`. This is SQLFlow's inferred catalog from the SQL (with `--default-server/database/schema` applied at parse time). `src/gsp_openmetadata_sidecar/lineage_mapper.py::_build_id_to_fqn` walks it to produce `{sqlflow_entity_id: "server.db.schema.table"}`.
+- **`relationships[]`** — column-level flow edges, each with a `target` and `sources[]`. `lineage_mapper.py::extract_lineage` filters to persistent effects (`create_view`, `insert`, `merge`, …), resolves intermediate result-sets (`RS-*`, `MERGE-INSERT-*`) transitively back to real tables, and emits `TableLineage(upstream_table, downstream_table, column_mappings[])` dataclasses.
+
+The `upstream_table` / `downstream_table` strings are the tables that need to exist in OpenMetadata. `emitter.py` then completes them to 4-part FQNs via `_build_fqn` (using `--service-name`, `--database-name`, `--schema-name` as fallbacks) and does `GET /api/v1/tables/name/{fqn}` to resolve them to UUIDs.
 
 Example — given this SQL:
 
@@ -292,17 +424,17 @@ SQLFlow returns relationships like:
 
 The sidecar reads these and builds lineage edges.
 
+> **Implication for auto-creation of missing entities:** SQLFlow's JSON is authoritative for the *identity* and *hierarchy* (service/db/schema/table) of every referenced table, because those are what it parsed from the SQL. It is **not** authoritative for source-table columns, types, descriptions, or owners — SQLFlow never connected to the source database. The auto-create path therefore creates tables with an empty columns array and leaves column-level enrichment to a real ingestion connector.
+
 ### What happens when tables don't exist in OpenMetadata?
 
-The sidecar only creates lineage edges between existing entities — it does not create tables, databases, or schemas.
+There are two modes, chosen per-run:
 
-If a table referenced in the SQL is not found in OpenMetadata:
+**Default (feature off):** the sidecar only creates lineage *edges*. If a referenced table isn't found, it logs `Skipping lineage: upstream table not found: mssql.salesdb.dbo.customers`, skips that edge, and keeps going for the rest. This is the safe baseline — nothing is ever written to the catalog beyond lineage.
 
-- The sidecar logs `Skipping lineage: upstream table not found: mssql.salesdb.dbo.customers`
-- That specific edge is skipped
-- Other edges (where both sides exist) are still emitted
+**Opt-in (`--auto-create-entities`):** the sidecar runs a pre-pass planner, creates any missing `Database` / `DatabaseSchema` / `Table` via `POST` (never `PUT`, never `DatabaseService`), enforces a hard safety cap, and then emits the lineage. Column lineage is suppressed on edges touching freshly-created or column-less endpoints — the sidecar never invents columns. See [`docs/auto-create-operator-guide.md`](docs/auto-create-operator-guide.md) for safety invariants, RBAC requirements, and the rollout recipe.
 
-So either run OpenMetadata's metadata ingestion first, or create the table entities via the OpenMetadata API / UI.
+In either mode, running OpenMetadata's native metadata ingestion first remains the recommended way to populate the catalog — auto-create is a fallback for tables ingestion can't see (ephemeral staging, ad-hoc sources, pre-onboarding pilots).
 
 ### Case-insensitive entity matching
 
@@ -347,9 +479,28 @@ When SQL references a table without a full `database.schema.table` path, SQLFlow
 
 Square brackets, backticks, and quotes are automatically stripped. All table/database/schema names from SQL are lowercased during FQN construction (with case-insensitive search fallback).
 
-### When to set `--database-name`
+## SQLFlow default qualifiers (parse-time)
 
-If your SQL uses fully-qualified names like `[SalesDB].[dbo].[Customers]`, you don't need `--database-name`. If your SQL uses short names like `SELECT * FROM Customers`, you must provide `--database-name` so the sidecar knows which database to look up in OpenMetadata.
+`--default-server`, `--default-database`, and `--default-schema` are sent to SQLFlow as the `defaultServer` / `defaultDatabase` / `defaultSchema` request fields. They influence how SQLFlow *parses* unqualified references — before lineage ever reaches the sidecar. This is a different layer from `--database-name` / `--schema-name`, which only fill in the OM FQN on the sidecar side. Set both pairs (or neither) depending on which layer needs the default.
+
+| Layer | Flags | What they do |
+|---|---|---|
+| SQLFlow (parse-time) | `--default-server` / `--default-database` / `--default-schema` | SQLFlow populates the server/database/schema of its output tree so unqualified SQL (e.g. `SELECT * FROM Customers`) resolves to a real qualified table instead of the placeholder `DEFAULT_SERVER.DEFAULT.DEFAULT.Customers`. |
+| Sidecar (FQN-assembly) | `--service-name` / `--database-name` / `--schema-name` | Sidecar builds OpenMetadata FQNs from SQLFlow's output. Fills in missing parts when SQLFlow returned fewer than 3 segments. |
+
+Typical pairing:
+
+```bash
+gsp-openmetadata-sidecar \
+  --sql "SELECT * FROM Customers" \
+  --default-database SalesDB --default-schema dbo \
+  --service-name mssql_prod --database-name SalesDB --schema-name dbo \
+  --dry-run
+```
+
+Without the `--default-*` flags, SQLFlow returns `CUSTOMERS` as a one-part name and the sidecar fills in from `--database-name` / `--schema-name`. With them, SQLFlow's tree itself carries `SalesDB.dbo.Customers`, the mapper prefers that qualified form, and the sidecar-side defaults become load-bearing only for references SQLFlow couldn't qualify at all.
+
+The three flags are only applied by the HTTP backends. In `local_jar` mode they are ignored with a warning, because the `DataFlowAnalyzer` CLI does not expose them.
 
 ## Configuration reference
 
@@ -370,6 +521,9 @@ All settings can be provided via CLI flags, environment variables, or a YAML con
 |---|---|---|---|
 | SQLFlow URL | `--sqlflow-url` | `GSP_SQLFLOW_URL` | `sqlflow.url` |
 | SQL dialect | `--db-vendor` | `GSP_DB_VENDOR` | `sqlflow.db_vendor` |
+| SQLFlow default server | `--default-server` | `GSP_DEFAULT_SERVER` | `sqlflow.default_server` |
+| SQLFlow default database | `--default-database` | `GSP_DEFAULT_DATABASE` | `sqlflow.default_database` |
+| SQLFlow default schema | `--default-schema` | `GSP_DEFAULT_SCHEMA` | `sqlflow.default_schema` |
 | SQL file | `--sql-file` | `GSP_SQL_FILE` | `input.sql_file` |
 | Inline SQL | `--sql` | `GSP_SQL_TEXT` | `input.sql_text` |
 | OM server | `--om-server` | `GSP_OM_SERVER` | `openmetadata.server` |
@@ -387,6 +541,10 @@ All settings can be provided via CLI flags, environment variables, or a YAML con
 | Dry run | `--dry-run` | — | — | Skip the write to OpenMetadata |
 | JSON output | `--json` | — | — | Print raw SQLFlow response to stdout |
 | Verbose logging | `-v` / `--verbose` | — | — | Enable DEBUG-level logs |
+| Auto-create entities | `--auto-create-entities` / `--no-auto-create-entities` | `GSP_OM_AUTO_CREATE_ENTITIES` | `openmetadata.auto_create_entities` | Opt-in; see [Auto-create missing entities](#auto-create-missing-entities-opt-in) |
+| Create-failure policy | `--on-create-failure {abort,skip-edge}` | `GSP_OM_ON_CREATE_FAILURE` | `openmetadata.on_create_failure` | Default `abort`. 401/403 always fatal regardless. |
+| Safety cap | `--max-entities-to-create N` | `GSP_OM_MAX_ENTITIES_TO_CREATE` | `openmetadata.max_entities_to_create` | Default 100. Plan aborts before any write if exceeded. |
+| Audit tag | — | `GSP_OM_AUTO_CREATED_TAG_FQN` | `openmetadata.auto_created_tag_fqn` | Best-effort PATCH each auto-created entity with this tag. |
 
 ## Input handling
 
@@ -407,7 +565,19 @@ Statement-boundary detection is heuristic: it keys off keyword presence, not ful
 The anonymous tier is 50 calls/day per IP. The tool exits with code `2` on this error. Switch to `authenticated` (10k/month) or `self_hosted` (unlimited).
 
 **`Skipping lineage: upstream table not found: …`**
-That FQN does not exist in OpenMetadata. Run OpenMetadata ingestion first, or create the table entity. The sidecar keeps going and emits the other edges it *can* resolve — a single file can partially succeed.
+That FQN does not exist in OpenMetadata. Run OpenMetadata ingestion first, create the table entity, or re-run with `--auto-create-entities` (see [Auto-create missing entities](#auto-create-missing-entities-opt-in)). The sidecar keeps going and emits the other edges it *can* resolve — a single file can partially succeed.
+
+**`auto_create_entities=true requires sqlflow.default_database … AND sqlflow.default_schema …`**
+Auto-create refuses to run without defaults because partial SQL references (e.g. bare `customers`) would otherwise synthesize ghost entities at non-4-part FQNs. Set `--default-database` + `--default-schema` (or the `openmetadata.database_name` / `schema_name` equivalents).
+
+**`Plan would create N entities; max_entities_to_create=M`**
+The pre-pass planner counted more missing entities than `--max-entities-to-create` (default 100) allows. Re-run with `--dry-run` to review the full tree, confirm the count matches your expectation, then raise `--max-entities-to-create` explicitly.
+
+**`OpenMetadata rejected the minimal create payload … at preflight`**
+Auto-create's first write returned HTTP 400. Your OpenMetadata version may have tightened payload validation beyond what the sidecar expects. See [`docs/entity-emission-api-evidence.md`](docs/entity-emission-api-evidence.md) for the payload shapes the sidecar sends. File an issue with the OM version + 400 body.
+
+**`Auto-create refuses foreign service 'X' (configured: 'Y')`**
+A lineage FQN named an OpenMetadata service other than the one you configured. Either the SQL or an upstream emitter labeled the lineage incorrectly. The sidecar is single-service by design; run once per service.
 
 **Multi-statement files can partially succeed.** Per-statement errors are logged and counted, but processing continues through the rest of the file. The process still exits with code `1` if any statement failed.
 

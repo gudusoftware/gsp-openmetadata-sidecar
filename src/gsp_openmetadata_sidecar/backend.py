@@ -28,11 +28,20 @@ class SQLFlowBackend(ABC):
         """
 
     def _build_payload(self, sql: str, db_vendor: str, **kwargs) -> dict:
-        return {
+        payload: dict[str, Any] = {
             "sqltext": sql,
             "dbvendor": db_vendor,
             "showRelationType": kwargs.get("show_relation_type", "fdd"),
         }
+        for api_key, kw_key in (
+            ("defaultServer", "default_server"),
+            ("defaultDatabase", "default_database"),
+            ("defaultSchema", "default_schema"),
+        ):
+            val = kwargs.get(kw_key)
+            if val:
+                payload[api_key] = val
+        return payload
 
 
 class SQLFlowError(Exception):
@@ -324,6 +333,12 @@ class LocalJarBackend(SQLFlowBackend):
 def create_backend(config: SQLFlowConfig) -> SQLFlowBackend:
     """Factory: create the right backend based on config mode."""
     if config.mode == "local_jar":
+        if any((config.default_server, config.default_database, config.default_schema)):
+            logger.warning(
+                "default_server/default_database/default_schema are not applied in "
+                "local_jar mode — the DataFlowAnalyzer CLI does not accept these flags. "
+                "They will be ignored. Use an HTTP backend to benefit from them."
+            )
         logger.info("Using local-JAR backend: %s", config.jar_path)
         return LocalJarBackend(
             jar_path=config.jar_path or "",

@@ -37,6 +37,12 @@ INTERMEDIATE_PREFIXES = (
     "MERGE-INSERT-", "MERGE-UPDATE-", "MERGE-DELETE-", "MERGE-WHEN-",
 )
 
+# Placeholder segments SQLFlow emits in the dbobjs tree when
+# defaultServer/defaultDatabase/defaultSchema are not supplied. They must be
+# dropped from any qualified name reconstruction; otherwise we'd produce
+# garbage FQNs like ``DEFAULT_SERVER.DEFAULT.DEFAULT.customers``.
+_PLACEHOLDER_SEGMENTS = {"DEFAULT_SERVER", "DEFAULT"}
+
 
 def _vendor_is_powerquery(db_vendor: str) -> bool:
     return (db_vendor or "").strip().lower() in POWERQUERY_VENDOR_ALIASES
@@ -119,6 +125,71 @@ def _find_key(obj, key: str):
     return None
 
 
+def _build_id_to_fqn(sqlflow_response: dict) -> dict[str, str]:
+    """Build a map from dbobjs entity id to a qualified name.
+
+    An entry is emitted ONLY when the tree has real (non-placeholder) values
+    for both the database and the schema. Server is optional — when it is
+    real, it is prepended as a fourth segment (``server.db.schema.table``);
+    ``_build_fqn`` takes the last three parts, so the extra server segment
+    is harmlessly discarded.
+
+    The strictness is deliberate. A naive per-segment strip collapses
+    positional information: e.g. ``srv01.DEFAULT.dbo.T`` becoming
+    ``srv01.dbo.T`` would be misread by ``_build_fqn`` as ``db=srv01`` since
+    it keys off segment count rather than role. By refusing to emit a name
+    unless db + schema are both present, the compact form always aligns with
+    ``_build_fqn``'s ``database.schema.table`` interpretation. Ambiguous
+    partial trees fall back to bare ``parentName`` — which is what a caller
+    who did not set defaults would have seen before this change.
+    """
+    result: dict[str, str] = {}
+    dbobjs = _find_key(sqlflow_response, "dbobjs")
+    if not dbobjs:
+        return result
+    for server in dbobjs.get("servers", []) or []:
+        s_name = server.get("name") or ""
+        s_keep = bool(s_name) and s_name not in _PLACEHOLDER_SEGMENTS
+        for db in server.get("databases", []) or []:
+            d_name = db.get("name") or ""
+            d_keep = bool(d_name) and d_name not in _PLACEHOLDER_SEGMENTS
+            for schema in db.get("schemas", []) or []:
+                sc_name = schema.get("name") or ""
+                sc_keep = bool(sc_name) and sc_name not in _PLACEHOLDER_SEGMENTS
+                if not (d_keep and sc_keep):
+                    # Ambiguous or fully placeholder. Fall back to parentName.
+                    continue
+                entities = (schema.get("tables") or []) + (schema.get("views") or [])
+                for ent in entities:
+                    ent_id = ent.get("id")
+                    ent_name = ent.get("name") or ""
+                    if ent_id is None or not ent_name:
+                        continue
+                    parts: list[str] = []
+                    if s_keep:
+                        parts.append(s_name)
+                    parts.append(d_name)
+                    parts.append(sc_name)
+                    parts.append(ent_name)
+                    result[str(ent_id)] = ".".join(parts)
+    return result
+
+
+def _qualified_parent_name(node: dict, id_to_fqn: dict[str, str]) -> str:
+    """Prefer the dbobjs-resolved qualified name when available.
+
+    Falls back to bare ``parentName`` for intermediates (RS-*, MERGE-*) and for
+    entities whose tree entry is all placeholders — preserving status-quo
+    behavior for users who don't set default_server/database/schema.
+    """
+    pid = node.get("parentId")
+    if pid is not None:
+        resolved = id_to_fqn.get(str(pid))
+        if resolved:
+            return resolved
+    return node["parentName"]
+
+
 def extract_lineage(
     sqlflow_response: dict,
     db_vendor: str = "",
@@ -156,19 +227,27 @@ def extract_lineage(
     if function_names:
         logger.debug("Function nodes (treated as intermediates): %s", function_names)
 
+    # Build id -> qualified name map once. All downstream name accesses prefer
+    # the tree-resolved name over bare ``parentName`` so that unqualified SQL
+    # parsed with default_server/database/schema lands at real tables instead
+    # of single-segment names.
+    id_to_fqn = _build_id_to_fqn(sqlflow_response)
+
     # Phase 1: collect all fdd relationships
     all_rels = [r for r in relationships if r.get("type") == "fdd"]
     logger.debug("Total fdd relationships: %d", len(all_rels))
 
     # Phase 2: build a reverse lookup — for each intermediate column,
     # trace back to the real source columns
-    # Key: (parentName, column) -> list of (sourceParentName, sourceColumn)
+    # Key: (qualified_parent_name, column) -> list of (source_qualified, sourceColumn)
     reverse_map: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
     for rel in all_rels:
         tgt = rel["target"]
-        tgt_key = (tgt["parentName"], tgt["column"])
+        tgt_key = (_qualified_parent_name(tgt, id_to_fqn), tgt["column"])
         for src in rel.get("sources", []):
-            reverse_map[tgt_key].append((src["parentName"], src["column"]))
+            reverse_map[tgt_key].append(
+                (_qualified_parent_name(src, id_to_fqn), src["column"])
+            )
 
     def resolve_sources(parent_name: str, column: str, visited: set | None = None) -> list[tuple[str, str]]:
         """Recursively resolve intermediate result sets to real source tables."""
@@ -203,7 +282,7 @@ def extract_lineage(
             continue
 
         target = rel["target"]
-        target_table = target["parentName"]
+        target_table = _qualified_parent_name(target, id_to_fqn)
         target_column = target["column"]
 
         if _is_intermediate(target_table, function_names):
@@ -215,7 +294,7 @@ def extract_lineage(
                 continue  # target should be a real table
 
         for src in rel.get("sources", []):
-            src_parent = src["parentName"]
+            src_parent = _qualified_parent_name(src, id_to_fqn)
             src_column = src["column"]
 
             # Resolve through intermediates

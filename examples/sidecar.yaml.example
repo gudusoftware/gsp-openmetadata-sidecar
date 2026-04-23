@@ -20,6 +20,19 @@ sqlflow:
   # SQL dialect (default: dbvmssql)
   db_vendor: dbvmssql
 
+  # Parse-time default qualifiers sent to SQLFlow. These populate the server /
+  # database / schema in SQLFlow's output tree when the SQL itself does not
+  # qualify a reference. INDEPENDENT from openmetadata.database_name /
+  # schema_name / service_name below, which fill in the OM FQN on the sidecar
+  # side.
+  #
+  # Only applied by HTTP backends (anonymous, authenticated, self_hosted). In
+  # local_jar mode these are ignored with a warning because the
+  # DataFlowAnalyzer CLI does not expose them.
+  # default_server:   "sqlserver01"
+  # default_database: "SalesDB"
+  # default_schema:   "dbo"
+
 openmetadata:
   # OpenMetadata API server
   server: "http://localhost:8585/api"
@@ -37,3 +50,29 @@ openmetadata:
 
   # Emit column-level lineage (default: true)
   column_lineage: true
+
+  # --- Opt-in auto-creation of missing entities (default: off) ---
+  # When true, the sidecar will look up each lineage endpoint and create
+  # any missing Database / DatabaseSchema / Table entities via POST before
+  # emitting the edge. DatabaseService is never auto-created. Requires
+  # sqlflow.default_database + sqlflow.default_schema (or the openmetadata.*
+  # equivalents) so partial FQNs can't become ghost entities. See the
+  # "Auto-create missing entities" section of README.md.
+  # auto_create_entities: false
+  #
+  # Policy when a per-entity create fails after preflight passed.
+  # - "abort"     : fail the whole run on the first per-entity failure (default)
+  # - "skip-edge" : warn, mark the entity failed, skip any edges depending on
+  #                 it, continue with unrelated entities.
+  # 401/403 are always fatal regardless of this knob.
+  # on_create_failure: abort
+  #
+  # Hard cap on plan size. The planner aborts before any write if the plan
+  # would create more than this number of entities (DB + Schema + Table).
+  # Raise it deliberately for large back-fills.
+  # max_entities_to_create: 100
+  #
+  # Optional tag applied to every entity this sidecar auto-creates. Useful
+  # for audit: "show me every entity gsp-sidecar brought into the catalog".
+  # The tag itself must exist in OpenMetadata (Settings → Classifications).
+  # auto_created_tag_fqn: "AutoCreated.gsp-sidecar"
