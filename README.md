@@ -157,6 +157,7 @@ A short list of the failure modes most new users hit:
 - **Expecting `local_jar` mode to honor `--default-*`.** It doesn't — SQLFlow's JAR CLI doesn't accept those.
 - **Expecting lineage push to create tables by itself.** It doesn't. Either ingest structure first, or pass [`--auto-create-entities`](#auto-create-missing-entities-opt-in).
 - **Bot token missing `EditLineage`.** `PUT /api/v1/lineage` returns 403. Add the permission or grant the bot the `DataConsumer` role.
+- **Expecting column-level lineage after an auto-create run.** Auto-created tables are intentionally skeletal (no columns), so column lineage is suppressed on edges touching them. See [Why isn't there column lineage after auto-create?](#why-isnt-there-column-lineage-after-auto-create) below.
 
 ## Common commands
 
@@ -224,6 +225,39 @@ gsp-openmetadata-sidecar \
 ```
 
 For safety invariants, rollout recipe, and stop-ship criteria before rolling this out on a real OpenMetadata instance, see [**`docs/auto-create-operator-guide.md`**](docs/auto-create-operator-guide.md).
+
+### Why isn't there column lineage after auto-create?
+
+This is the single biggest surprise on a first auto-create run, so call it out up front:
+
+**Auto-created tables have no columns.** The sidecar POSTs them with `columns: []` because SQLFlow never connected to the source database and therefore doesn't know the column types, lengths, nullability, or ordering. Inventing column metadata on admin-curated entities would be worse than leaving the tables skeletal — an ingestion connector that later scans the source cannot reliably diff-and-merge against placeholder columns.
+
+**Column lineage is then suppressed on every edge touching a skeletal endpoint.** You'll see this in the run summary:
+
+```
+Lineage emission complete: 2 emitted, 0 skipped (column lineage suppressed on 2 edges, 0 column-pair(s) filtered)
+```
+
+Table-level arrows appear in the OM UI as usual; the thin column-to-column lines inside them do not.
+
+**To get column lineage back**, populate the columns on the tables and re-run the sidecar. Normal path:
+
+1. Run OM's native structural ingestion (Airflow DAG or the Ingestion container) against the source. It fills `columns[]` on the existing skeletal entities.
+2. Re-run the sidecar on the same SQL. It finds the tables already exist (via exact FQN lookup), sees they now have columns, and emits full column-level `columnsLineage`.
+
+For a smoke test without a real source database, you can PATCH columns onto the skeletal tables directly:
+
+```bash
+curl -X PATCH "$GSP_OM_SERVER/v1/tables/name/mssql_prod.sales.dbo.invoices" \
+  -H "Authorization: Bearer $GSP_OM_TOKEN" \
+  -H "Content-Type: application/json-patch+json" \
+  -d '[{"op":"replace","path":"/columns","value":[
+        {"name":"InvoiceDate","dataType":"DATETIME"},
+        {"name":"CustomerId","dataType":"BIGINT"},
+        {"name":"Amount","dataType":"NUMERIC"}]}]'
+```
+
+Then re-run the sidecar (no `--auto-create-entities` needed; the tables already exist). Column casing doesn't have to match SQLFlow's output — the sidecar does case-insensitive matching via a lowercase→canonical map.
 
 ## Backend modes
 
