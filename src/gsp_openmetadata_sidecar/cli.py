@@ -41,7 +41,9 @@ def main():
             "  # Push lineage to OpenMetadata:\n"
             "  gsp-openmetadata-sidecar --config sidecar.yaml --sql-file proc.sql\n\n"
             "  # Use self-hosted SQLFlow Docker:\n"
-            "  gsp-openmetadata-sidecar --mode self_hosted --sql-file proc.sql --dry-run\n"
+            "  gsp-openmetadata-sidecar --mode self_hosted --sql-file proc.sql --dry-run\n\n"
+            "  # Push lineage produced offline by the lineage evaluator:\n"
+            "  gsp-openmetadata-sidecar --config sidecar.yaml --from-lineage-json lineage.json\n"
         ),
     )
 
@@ -54,6 +56,12 @@ def main():
     input_group.add_argument(
         "--sql",
         help="Inline SQL text to analyze.",
+    )
+    input_group.add_argument(
+        "--from-lineage-json",
+        metavar="PATH",
+        help="Push an already-analyzed lineage-eval.v1 JSON file (from the offline lineage "
+             "evaluator). No SQL is parsed and no SQLFlow backend is used.",
     )
 
     # --- Config ---
@@ -246,6 +254,14 @@ def main():
         config.input.sql_file = args.sql_file
     if args.sql:
         config.input.sql_text = args.sql
+
+    # --- Pre-analyzed input: no SQL parsing, no SQLFlow backend is ever created ---
+    if args.from_lineage_json:
+        if config.openmetadata.auto_create_entities:
+            logger.error("--auto-create-entities is not supported with --from-lineage-json yet.")
+            sys.exit(1)
+        from . import lineage_json_input
+        sys.exit(lineage_json_input.run(config, args.from_lineage_json, args.dry_run))
 
     # CLI overrides may have toggled the feature; re-validate the combined
     # config before we hit the network.
