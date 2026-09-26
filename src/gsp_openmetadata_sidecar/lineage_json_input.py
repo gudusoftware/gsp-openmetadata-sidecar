@@ -175,6 +175,13 @@ def render_plan(plans: list[EdgePlan], report: PlanReport) -> str:
 # --------------------------------------------------------------------------- merge (no I/O)
 
 
+def _unquote(name: str) -> str:
+    """[Addr.Loc.City] / "x" / `x` -> the bare identifier (quoting keeps dots and spaces literal)."""
+    if len(name) >= 2 and (name[0], name[-1]) in {("[", "]"), ('"', '"'), ("`", "`")}:
+        return name[1:-1]
+    return name
+
+
 def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: dict
                     ) -> tuple[list[dict], list[str]]:
     """Map name pairs to column FQNs: exact name first, then a UNIQUE case-insensitive match.
@@ -191,6 +198,7 @@ def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: d
         return exact, folded
 
     def find(name: str, idx: tuple[dict, dict]) -> Optional[str]:
+        name = _unquote(name)
         exact, folded = idx
         if name in exact:
             return exact[name]
@@ -272,15 +280,29 @@ def _resolve_table(client: OpenMetadataClient, service: str, ref: TableRef) -> O
     return None
 
 
+# lineageDetails keys; getLineageEdge in OpenMetadata 2.0.x returns them FLAT under "edge"
+# ({"edge": {"columnsLineage": [...], "source": ...}}), older payloads nest them under
+# "edge.lineageDetails". Both shapes are accepted; an edge with none of these keys has no details.
+_DETAIL_KEYS = {"sqlQuery", "columnsLineage", "pipeline", "description", "source", "assetEdges",
+                "tempLineageTables", "createdAt", "createdBy", "updatedAt", "updatedBy"}
+
+
+def edge_details_from_response(body: Optional[dict]) -> Optional[dict]:
+    """The lineageDetails of a getLineageEdge response, or None when the edge carries none."""
+    edge = (body or {}).get("edge", body) or {}
+    if isinstance(edge.get("lineageDetails"), dict):
+        return edge["lineageDetails"]
+    details = {k: v for k, v in edge.items() if k in _DETAIL_KEYS}
+    return details or None
+
+
 def _get_edge_details(client: OpenMetadataClient, from_id: str, to_id: str) -> Optional[dict]:
     url = f"{client.base_url}/v1/lineage/getLineageEdge/{from_id}/{to_id}"
     resp = requests.get(url, headers=client._headers(), timeout=30)
     if resp.status_code == 404:
         return None
     resp.raise_for_status()
-    body = resp.json() or {}
-    edge = body.get("edge", body)
-    return edge.get("lineageDetails")
+    return edge_details_from_response(resp.json())
 
 
 def push(client: OpenMetadataClient, service: str, plans: list[EdgePlan]) -> PushResult:

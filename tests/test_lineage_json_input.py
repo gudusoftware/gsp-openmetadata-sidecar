@@ -179,8 +179,10 @@ def test_push_merges_with_existing_edge_then_is_a_no_op_on_rerun():
     existing = {"source": "QueryLineage", "sqlQuery": "native",
                 "columnsLineage": [{"fromColumns": ["svc.SalesDB.dbo.customers.customer_id"],
                                     "toColumn": "svc.SalesDB.dbo.customer_profile.customer_id"}]}
+    # the FLAT shape OpenMetadata 2.0.2 really returns (recorded from a live server): details sit
+    # directly under "edge", not under "edge.lineageDetails"
     responses.get(f"{OM}/v1/lineage/getLineageEdge/customers/customer_profile",
-                  json={"edge": {"lineageDetails": existing}})
+                  json={"edge": {**existing, "createdAt": 1790440859735, "createdBy": "ingestion-bot"}})
     put = responses.put(f"{OM}/v1/lineage", json={})
     client = OpenMetadataClient(OpenMetadataConfig(server=OM, service_name="svc"))
     plans, _ = lj.plan_edges(TWO_PROCS_ONE_PAIR)
@@ -194,10 +196,35 @@ def test_push_merges_with_existing_edge_then_is_a_no_op_on_rerun():
 
     # second run: the server now holds exactly what we sent -> nothing is written
     responses.replace(responses.GET, f"{OM}/v1/lineage/getLineageEdge/customers/customer_profile",
-                      json={"edge": {"lineageDetails": sent}})
+                      json={"edge": {**sent, "updatedAt": 1790441556980, "updatedBy": "ingestion-bot"}})
     again = lj.push(client, "svc", plans)
     assert (again.written, again.unchanged) == (0, 1)
     assert len(put.calls) == 1
+
+
+# Recorded from OpenMetadata 2.0.2 (GET /v1/lineage/getLineageEdge/{fromId}/{toId}), ids shortened.
+LIVE_2_0_2_EDGE = {"edge": {
+    "columnsLineage": [{"fromColumns": ["svc.SalesDB.dbo.customers.customer_id"],
+                        "toColumn": "svc.SalesDB.dbo.customer_profile.customer_id"}],
+    "description": "d", "source": "QueryLineage",
+    "createdAt": 1790440859735, "createdBy": "ingestion-bot",
+    "updatedAt": 1790441556980, "updatedBy": "ingestion-bot"}}
+
+
+def test_edge_details_are_read_from_the_2_0_2_flat_shape_and_the_nested_shape():
+    flat = lj.edge_details_from_response(LIVE_2_0_2_EDGE)
+    assert flat["source"] == "QueryLineage" and len(flat["columnsLineage"]) == 1
+    nested = lj.edge_details_from_response({"edge": {"fromEntity": {}, "toEntity": {},
+                                                     "lineageDetails": {"source": "ViewLineage"}}})
+    assert nested == {"source": "ViewLineage"}
+    assert lj.edge_details_from_response({"edge": {}}) is None
+    assert lj.edge_details_from_response({"edge": {"fromEntity": {}, "toEntity": {}}}) is None
+
+
+def test_bracket_quoted_column_names_match_the_bare_entity_column():
+    up, down = entity("svc.db.dbo.a", "Resume"), entity("svc.db.dbo.v", "Addr.Loc.City")
+    cols, rejected = lj.resolve_columns({("Resume", "[Addr.Loc.City]")}, up, down)
+    assert rejected == [] and cols[0]["toColumn"] == "svc.db.dbo.v.Addr.Loc.City"
 
 
 @responses.activate

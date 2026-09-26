@@ -259,6 +259,45 @@ curl -X PATCH "$GSP_OM_SERVER/v1/tables/name/mssql_prod.sales.dbo.invoices" \
 
 Then re-run the sidecar (no `--auto-create-entities` needed; the tables already exist). Column casing doesn't have to match SQLFlow's output — the sidecar does case-insensitive matching via a lowercase→canonical map.
 
+## Push pre-analyzed lineage (`--from-lineage-json`)
+
+If the SQL has already been analyzed offline — for example by an evaluator that runs the GSP
+lineage engine inside your network and writes a `lineage-eval.v1` JSON file — push that file
+instead of SQL. No SQL is parsed and no SQLFlow backend is contacted; the sidecar talks only to
+OpenMetadata.
+
+```bash
+gsp-openmetadata-sidecar --from-lineage-json lineage.json --dry-run            # show the plan
+gsp-openmetadata-sidecar --from-lineage-json lineage.json \
+  --om-server http://localhost:8585/api --om-token "$OM_BOT_JWT" --service-name mssql_prod
+```
+
+What gets pushed — every fact in the file carries a `kind`:
+
+| kind | pushed as |
+|---|---|
+| `COLUMN` | a column mapping in `columnsLineage`, unless it is *indirect* (a `WHERE`/`JOIN`/`CASE WHEN` column that decides rows or branch rather than supplying the value): those give a table-level edge only |
+| `ROW_LEVEL`, `TABLE` | a table-level edge only |
+| `CONSTANT`, `CALL` | nothing (no source table / a procedure call, not data movement) |
+
+How it writes:
+
+- **All procedures are aggregated per table pair first**, so two procedures that write different
+  columns of the same table end up on one edge with all of their columns.
+- **Read-merge-write.** `PUT /v1/lineage` replaces an edge's whole `lineageDetails`, so the sidecar
+  reads the existing edge first and only *adds* to it: lineage from OpenMetadata's own ingestion
+  (or entered by hand) — its `sqlQuery`, `source`, column mappings and description — is kept.
+  A line in the edge description lists the contributing procedures.
+- **Reruns are no-ops.** An edge whose merged details equal what the server already has is not
+  written again.
+- **No guessing.** Tables must resolve to an entity with that exact FQN (case-insensitively); a
+  column must match exactly or by a *unique* case-insensitive match. Anything else is reported
+  (`tables not found`, `column mapping rejected`) and skipped.
+- `--auto-create-entities` is not supported in this mode yet: ingest the database's metadata
+  with OpenMetadata's connector first.
+
+Exit code: `0` success, `1` unreadable input, `2` at least one edge failed to write.
+
 ## Backend modes
 
 | Mode | Auth | Rate limit | Data stays… | Best for |
