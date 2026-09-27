@@ -7,7 +7,7 @@ import sys
 
 from . import __version__
 from .backend import RateLimitError, SQLFlowError, create_backend
-from .config import load_config
+from .config import INDIRECT_COLUMN_MODES, load_config
 from .emitter import FatalRunError, emit_lineage
 from .entity_planner import CapExceededError, ForeignServiceError
 from .lineage_mapper import extract_lineage
@@ -271,6 +271,10 @@ def main():
     if args.from_lineage_json:
         if config.openmetadata.auto_create_entities:
             logger.error("--auto-create-entities is not supported with --from-lineage-json yet.")
+            sys.exit(1)
+        if config.openmetadata.indirect_columns not in INDIRECT_COLUMN_MODES:
+            logger.error("indirect_columns must be one of %s, got %r",
+                         sorted(INDIRECT_COLUMN_MODES), config.openmetadata.indirect_columns)
             sys.exit(1)
         from . import lineage_json_input
         sys.exit(lineage_json_input.run(config, args.from_lineage_json, args.dry_run))

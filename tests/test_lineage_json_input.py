@@ -318,6 +318,22 @@ def test_a_column_that_is_both_value_and_condition_is_recorded_once_as_value():
         assert lj.merge_details({}, ours, {"p"})["columnsLineage"] == [{"fromColumns": ["s.a.d"], "toColumn": "s.b.d"}]
 
 
+def test_a_value_mapping_is_not_suppressed_by_this_tools_own_earlier_label():
+    label = {"fromColumns": ["s.a.d"], "toColumn": "s.b.d", "function": "CASE WHEN condition"}
+    value = {"fromColumns": ["s.a.d"], "toColumn": "s.b.d"}
+    first = lj.merge_details({}, [label], {"p1"})                      # push 1: only the condition
+    second = lj.merge_details(first, [value], {"p2"})                  # push 2: the same pair as a value
+    assert second["columnsLineage"] == [label, value]                  # label kept verbatim, value added
+    third = lj.merge_details(second, [value, label], {"p2"})
+    assert lj._normalized(third) == lj._normalized(second)             # reruns are no-ops
+
+
+def test_a_native_entry_with_a_sql_function_still_covers_a_value_mapping():
+    native = {"columnsLineage": [{"fromColumns": ["s.a.x"], "toColumn": "s.b.x", "function": "UPPER"}]}
+    merged = lj.merge_details(native, [{"fromColumns": ["s.a.x"], "toColumn": "s.b.x"}], {"p"})
+    assert merged["columnsLineage"] == native["columnsLineage"]
+
+
 def test_merge_appends_new_sources_as_their_own_entry_and_never_modifies_existing_ones():
     existing = {"columnsLineage": [{"fromColumns": ["s.a.x"], "toColumn": "s.b.x", "extra": 1},
                                    {"fromColumns": None, "toColumn": "s.b.n"}]}
@@ -553,10 +569,22 @@ def test_indirect_columns_option_reaches_the_plan_from_the_cli(tmp_path, monkeyp
     assert "credit_limit -> credit_band   (indirect: table-level only" in capsys.readouterr().out
 
 
-def test_indirect_columns_is_validated_and_read_from_the_environment(tmp_path, monkeypatch):
+def test_indirect_columns_is_read_from_the_environment_and_validated_after_cli_overrides(
+        tmp_path, monkeypatch, capsys):
     from gsp_openmetadata_sidecar.config import load_config
     monkeypatch.setenv("GSP_INDIRECT_COLUMNS", "all")
     assert load_config(None).openmetadata.indirect_columns == "all"
     monkeypatch.setenv("GSP_INDIRECT_COLUMNS", "everything")
-    with pytest.raises(ValueError, match="indirect_columns"):
-        load_config(None)
+    # a valid CLI value wins over an invalid environment value ...
+    assert _cli(monkeypatch, tmp_path, "--dry-run", "--indirect-columns", "none") == 0
+    assert "(indirect: table-level only" in capsys.readouterr().out
+    # ... and without it the invalid value is refused before anything is read or sent
+    assert _cli(monkeypatch, tmp_path, "--dry-run") == 1
+
+
+def test_run_refuses_an_unknown_indirect_columns_mode(tmp_path):
+    f = tmp_path / "x.json"
+    f.write_text(json.dumps(TWO_PROCS_ONE_PAIR))
+    config = SidecarConfig()
+    config.openmetadata.indirect_columns = "everything"
+    assert lj.run(config, str(f), dry_run=True) == lj.EXIT_INPUT

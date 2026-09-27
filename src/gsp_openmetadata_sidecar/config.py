@@ -170,12 +170,8 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
             setattr(getattr(cfg, section), attr, val)
 
     # --- Validate ---
-    if cfg.openmetadata.indirect_columns not in INDIRECT_COLUMN_MODES:
-        raise ValueError(
-            f"openmetadata.indirect_columns must be one of {sorted(INDIRECT_COLUMN_MODES)}, "
-            f"got {cfg.openmetadata.indirect_columns!r}"
-        )
-
+    # openmetadata.indirect_columns is validated where it is used (--from-lineage-json), after CLI
+    # overrides: a valid --indirect-columns must win over an invalid YAML/env value.
     valid_modes = {"anonymous", "authenticated", "self_hosted", "local_jar"}
     if cfg.sqlflow.mode not in valid_modes:
         raise ValueError(

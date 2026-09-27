@@ -291,8 +291,11 @@ as "SQL Function" when you click the column-level edge:
 | `none` | nothing — value lineage only | |
 
 Indirect facts not pushed as column mappings still give the table-level edge. A mapping already
-present on the edge — with any `function` or none — is never added twice; a column that is both a
-value and a condition is recorded once, as a value.
+present on the edge is never added twice, and a column that is both a value and a condition is
+recorded once, as a value. One exception across runs: a value mapping is not treated as present
+just because an earlier push labelled the same pair with one of the types above — it is added as a
+value entry of its own, and the earlier labelled entry is left as it was (existing entries are
+never modified).
 
 How it writes:
 

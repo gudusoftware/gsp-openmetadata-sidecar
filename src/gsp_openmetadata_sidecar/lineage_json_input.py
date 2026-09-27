@@ -52,6 +52,7 @@ INDIRECT_ROLES = {"FILTER", "JOIN", "CONDITION", "GROUP_BY"}
 INDIRECT_LABELS = {"CONDITION": "CASE WHEN condition", "GROUP_BY": "GROUP BY key",
                    "FILTER": "filter (WHERE/HAVING)", "JOIN": "join condition"}
 PUSHED_INDIRECT = {"condition": {"CONDITION"}, "all": set(INDIRECT_LABELS), "none": set()}
+_OUR_LABELS = set(INDIRECT_LABELS.values())
 STATUSES = {"OK", "PARTIAL", "FAILED"}
 
 # One description line records the contributing procedures as a JSON array, so names containing
@@ -383,15 +384,22 @@ def merge_details(existing: Optional[dict], ours: list[dict], contributors: set[
     Every existing field and every existing ``columnsLineage`` entry is kept verbatim — none is
     modified, merged or re-ordered. For each target, the source columns no existing entry already
     covers are appended as ONE new entry of their own (one per ``function`` label); mappings already
-    present — with any label or none — are not repeated. Unlabelled (value) entries go first, so a
-    column that is both a value and, say, a CASE WHEN condition is recorded once, as a value.
+    present are not repeated. Unlabelled (value) entries go first, so a column that is both a value
+    and, say, a CASE WHEN condition is recorded once, as a value. Across pushes, a value mapping is
+    not covered by an entry carrying one of THIS tool's indirect labels (it is appended next to that
+    unmodified entry); any other entry — a value, or a native one with a SQL function — covers it.
     """
     details = {k: v for k, v in (existing or {}).items() if k not in _NOT_DETAILS}
     entries = list(details.get("columnsLineage") or [])
     for entry in sorted(ours, key=lambda e: (e.get("function") is not None, e.get("function") or "",
                                              e["toColumn"])):
         target = entry["toColumn"]
-        covered = {f for e in entries if e.get("toColumn") == target for f in (e.get("fromColumns") or [])}
+        # a value mapping is not "covered" by an indirect label this tool wrote earlier (another
+        # push): it is appended as a value entry of its own; the labelled entry stays unmodified
+        labelled = entry.get("function") is not None
+        covered = {f for e in entries if e.get("toColumn") == target
+                   and (labelled or e.get("function") not in _OUR_LABELS)
+                   for f in (e.get("fromColumns") or [])}
         new = sorted(set(entry["fromColumns"]) - covered)
         if new:
             entries.append(_entry(new, target, entry.get("function")))
@@ -581,6 +589,9 @@ def run(config: SidecarConfig, path: str, dry_run: bool) -> int:
     """Entry point for ``--from-lineage-json``. Returns the process exit code:
     0 all written, 1 unusable input, 2 a lookup or write failed, 3 some tables/columns unresolved."""
     om = config.openmetadata
+    if om.indirect_columns not in PUSHED_INDIRECT:
+        logger.error("indirect_columns must be one of %s, got %r", sorted(PUSHED_INDIRECT), om.indirect_columns)
+        return EXIT_INPUT
     try:
         doc = load_lineage_json(path)
     except LineageJsonError as e:
