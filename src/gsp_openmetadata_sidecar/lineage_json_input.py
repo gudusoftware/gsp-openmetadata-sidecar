@@ -13,12 +13,20 @@ Contract (every fact carries a ``kind``):
 - ``CONSTANT``  target computed from constants; no source table. Not pushed.
 - ``CALL``      procedure calls procedure; an object dependency, not data movement. Not pushed.
 
-Facts are first aggregated per (upstream table, downstream table) across ALL procedures, then
-each edge is written with read-merge-write: OpenMetadata's ``PUT /v1/lineage`` replaces the
+The whole document is validated before any network call. Table names are kept exactly as
+written until they are resolved against the catalog; facts are then aggregated per resolved
+(upstream entity, downstream entity) pair, so ``Customers`` and ``customers`` merge only when
+the catalog says they are the same table.
+
+Each edge is written with read-merge-write: OpenMetadata's ``PUT /v1/lineage`` replaces the
 whole ``lineageDetails`` of an edge, so pushing procedure B's columns naively would erase
 procedure A's — and lineage already present (from OpenMetadata's own ingestion or entered by
-hand) must survive too. An edge whose merged details equal what the server already has is not
-written again, so repeated runs are no-ops.
+hand) must survive. Existing details are kept verbatim; this mode only adds column mappings and
+one contributor marker line. An edge whose merged details equal the server's is not rewritten.
+
+Concurrency: read-merge-write is NOT atomic. Two writers updating the same edge at the same
+time (two sidecar runs, or a sidecar run overlapping OpenMetadata's own lineage ingestion) can
+lose one writer's additions. Run one writer at a time, after OpenMetadata's ingestion finished.
 """
 
 from __future__ import annotations
@@ -27,26 +35,103 @@ import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import quote
 
 import requests
 
-from .config import SidecarConfig
-from .emitter import OpenMetadataClient
+from .config import OpenMetadataConfig, SidecarConfig
 
 logger = logging.getLogger(__name__)
 
 CONTRACT = "lineage-eval.v1"
 KINDS = {"COLUMN", "ROW_LEVEL", "TABLE", "CONSTANT", "CALL"}
 INDIRECT_ROLES = {"FILTER", "JOIN", "CONDITION"}
-# Written into lineageDetails.description so a later run can recognise (and extend) its own line
-# instead of appending a duplicate.
-DESCRIPTION_MARKER = "Column lineage recovered from stored procedures by gsp-openmetadata-sidecar: "
-# Server-managed fields of lineageDetails: never sent back.
-_SERVER_FIELDS = {"createdAt", "createdBy", "updatedAt", "updatedBy"}
+STATUSES = {"OK", "PARTIAL", "FAILED"}
+
+# One description line records the contributing procedures as a JSON array, so names containing
+# commas or quotes round-trip. A line with this prefix that is not valid JSON (e.g. edited by hand)
+# is left untouched and no contributors are recorded for that edge.
+MARKER_PREFIX = "gsp-openmetadata-sidecar contributors v1: "
+MAX_CONTRIBUTORS = 200
+# Edge identity and server-managed fields of a getLineageEdge response: never sent back.
+_NOT_DETAILS = {"fromEntity", "toEntity", "createdAt", "createdBy", "updatedAt", "updatedBy"}
+
+EXIT_OK, EXIT_INPUT, EXIT_FAILED, EXIT_INCOMPLETE = 0, 1, 2, 3
 
 
 class LineageJsonError(ValueError):
     """The input file is not a usable lineage-eval.v1 document."""
+
+
+class LookupFailed(RuntimeError):
+    """OpenMetadata could not be asked (auth, network, 5xx) — distinct from "table not found"."""
+
+
+# --------------------------------------------------------------------------- input validation
+
+
+def _text(value: Any) -> bool:
+    return isinstance(value, str) and value.strip() != ""
+
+
+def validate_document(doc: Any) -> None:
+    """Raise LineageJsonError on the first structural problem, before anything is sent."""
+    if not isinstance(doc, dict) or doc.get("contract") != CONTRACT:
+        found = doc.get("contract") if isinstance(doc, dict) else None
+        raise LineageJsonError(f"not a {CONTRACT} document (contract={found!r})")
+    procs = doc.get("procedures")
+    if not isinstance(procs, list):
+        raise LineageJsonError("'procedures' must be a list")
+    for i, proc in enumerate(procs):
+        where = f"procedures[{i}]"
+        if not isinstance(proc, dict):
+            raise LineageJsonError(f"{where} must be an object")
+        if proc.get("status") is not None and proc["status"] not in STATUSES:
+            raise LineageJsonError(f"{where}.status must be one of {sorted(STATUSES)}")
+        edges = proc.get("edges", [])
+        if not isinstance(edges, list):
+            raise LineageJsonError(f"{where}.edges must be a list")
+        for j, e in enumerate(edges):
+            _validate_edge(e, f"{where}.edges[{j}]")
+
+
+def _validate_edge(e: Any, where: str) -> None:
+    if not isinstance(e, dict):
+        raise LineageJsonError(f"{where} must be an object")
+    kind = e.get("kind")
+    if kind not in KINDS:
+        raise LineageJsonError(f"{where}: unknown fact kind {kind!r}")
+    src, tgt = e.get("source"), e.get("target")
+    if not isinstance(src, dict) or not isinstance(tgt, dict):
+        raise LineageJsonError(f"{where}: source and target must be objects")
+    if "indirect" in e and not isinstance(e["indirect"], bool):
+        raise LineageJsonError(f"{where}.indirect must be a boolean")
+    if not _text(tgt.get("table")):
+        raise LineageJsonError(f"{where}: target.table is required")
+    src_col, tgt_col = _text(src.get("column")), _text(tgt.get("column"))
+    if kind != "CONSTANT" and not _text(src.get("table")):
+        raise LineageJsonError(f"{where}: source.table is required for {kind}")
+    if kind == "COLUMN" and not (src_col and tgt_col):
+        raise LineageJsonError(f"{where}: COLUMN needs a column on both sides")
+    if kind == "ROW_LEVEL" and src_col == tgt_col:
+        raise LineageJsonError(f"{where}: ROW_LEVEL needs a column on exactly one side")
+    if kind in ("TABLE", "CALL") and (src_col or tgt_col):
+        raise LineageJsonError(f"{where}: {kind} must not carry columns")
+    if kind == "CONSTANT" and not tgt_col:
+        raise LineageJsonError(f"{where}: CONSTANT needs a target column")
+
+
+def load_lineage_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise LineageJsonError(f"cannot read {path}: {e}") from e
+    try:
+        validate_document(doc)
+    except LineageJsonError as e:
+        raise LineageJsonError(f"{path}: {e}") from None
+    return doc
 
 
 # --------------------------------------------------------------------------- planning (no I/O)
@@ -54,12 +139,10 @@ class LineageJsonError(ValueError):
 
 @dataclass(frozen=True)
 class TableRef:
+    """A table exactly as the file names it — never case-folded before catalog resolution."""
     database: Optional[str]
     schema: Optional[str]
     table: str
-
-    def key(self) -> tuple:
-        return tuple((p or "").lower() for p in (self.database, self.schema, self.table))
 
     def display(self) -> str:
         return ".".join(p for p in (self.database, self.schema, self.table) if p)
@@ -67,12 +150,12 @@ class TableRef:
 
 @dataclass
 class EdgePlan:
-    """Everything every procedure says about one upstream -> downstream table pair."""
+    """Everything every procedure says about one (as-written) upstream -> downstream pair."""
     upstream: TableRef
     downstream: TableRef
-    column_pairs: set[tuple[str, str]] = field(default_factory=set)   # (source column, target column)
-    aggregate_pairs: set[tuple[str, str]] = field(default_factory=set)  # subset labelled AGGREGATE (Q1)
-    indirect_pairs: set[tuple[str, str]] = field(default_factory=set)   # COLUMN facts kept out of columnsLineage
+    column_pairs: set[tuple[str, str]] = field(default_factory=set)
+    aggregate_pairs: set[tuple[str, str]] = field(default_factory=set)  # labelled AGGREGATE
+    indirect_pairs: set[tuple[str, str]] = field(default_factory=set)   # kept out of columnsLineage
     contributors: set[str] = field(default_factory=set)
 
 
@@ -86,41 +169,23 @@ class PlanReport:
     skipped_self_loop: int = 0
 
 
-def load_lineage_json(path: str) -> dict:
-    try:
-        with open(path, encoding="utf-8") as f:
-            doc = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        raise LineageJsonError(f"cannot read {path}: {e}") from e
-    if not isinstance(doc, dict) or doc.get("contract") != CONTRACT:
-        raise LineageJsonError(
-            f"{path} is not a {CONTRACT} document (contract={doc.get('contract') if isinstance(doc, dict) else None!r})")
-    if not isinstance(doc.get("procedures"), list):
-        raise LineageJsonError(f"{path}: 'procedures' must be a list")
-    return doc
-
-
-def _table(endpoint: dict, default_db: Optional[str], default_schema: Optional[str]) -> Optional[TableRef]:
-    table = endpoint.get("table")
-    if not table:
-        return None
-    return TableRef(endpoint.get("database") or default_db, endpoint.get("schema") or default_schema, table)
+def _table(endpoint: dict, default_db: Optional[str], default_schema: Optional[str]) -> TableRef:
+    return TableRef(endpoint.get("database") or default_db, endpoint.get("schema") or default_schema,
+                    endpoint["table"])
 
 
 def plan_edges(doc: dict, default_db: Optional[str] = None,
                default_schema: Optional[str] = None) -> tuple[list[EdgePlan], PlanReport]:
-    """Aggregate every fact of every procedure into one EdgePlan per table pair."""
+    """Aggregate the facts of every procedure per as-written table pair (doc must be validated)."""
     report = PlanReport()
-    plans: dict[tuple, EdgePlan] = {}
+    plans: dict[tuple[TableRef, TableRef], EdgePlan] = {}
     for proc in doc["procedures"]:
         report.procedures += 1
         name = proc.get("name") or proc.get("sourceFile") or "?"
         if proc.get("status") == "FAILED":
             report.failed_procedures.append(name)
         for edge in proc.get("edges", []):
-            kind = edge.get("kind")
-            if kind not in KINDS:
-                raise LineageJsonError(f"{name}: unknown fact kind {kind!r}")
+            kind = edge["kind"]
             report.facts_by_kind[kind] = report.facts_by_kind.get(kind, 0) + 1
             if kind == "CONSTANT":
                 report.skipped_constant += 1
@@ -130,12 +195,10 @@ def plan_edges(doc: dict, default_db: Optional[str] = None,
                 continue
             up = _table(edge["source"], default_db, default_schema)
             down = _table(edge["target"], default_db, default_schema)
-            if up is None or down is None:
-                raise LineageJsonError(f"{name}: {kind} fact without a table on both sides")
-            if up.key() == down.key():
+            if up == down:
                 report.skipped_self_loop += 1   # e.g. UPDATE t ... JOIN on t's own key
                 continue
-            plan = plans.setdefault((up.key(), down.key()), EdgePlan(up, down))
+            plan = plans.setdefault((up, down), EdgePlan(up, down))
             plan.contributors.add(name)
             if kind != "COLUMN":
                 continue
@@ -149,14 +212,17 @@ def plan_edges(doc: dict, default_db: Optional[str] = None,
             plan.column_pairs.add(pair)
             if edge.get("role") == "AGGREGATE":
                 plan.aggregate_pairs.add(pair)
-    return sorted(plans.values(), key=lambda p: (p.downstream.key(), p.upstream.key())), report
+    ordered = sorted(plans.values(), key=lambda p: (p.downstream.display(), p.upstream.display()))
+    return ordered, report
 
 
-def render_plan(plans: list[EdgePlan], report: PlanReport) -> str:
-    lines = [f"{report.procedures} procedure(s), {len(plans)} table-level edge(s); facts by kind: "
+def render_plan(plans: list[EdgePlan], report: PlanReport, column_lineage: bool = True) -> str:
+    lines = [f"{report.procedures} procedure(s), {len(plans)} table pair(s) as written; facts by kind: "
              + ", ".join(f"{k}={v}" for k, v in sorted(report.facts_by_kind.items()))]
     lines.append(f"not pushed: {report.skipped_constant} CONSTANT, {report.skipped_call} CALL, "
                  f"{report.skipped_self_loop} self-referencing")
+    if not column_lineage:
+        lines.append("--no-column-lineage: table-level edges only; existing column lineage is kept")
     if report.failed_procedures:
         lines.append("procedures the evaluator could not analyze: " + ", ".join(report.failed_procedures))
     for p in plans:
@@ -172,23 +238,24 @@ def render_plan(plans: list[EdgePlan], report: PlanReport) -> str:
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- merge (no I/O)
+# --------------------------------------------------------------------------- column resolution
 
 
-def _unquote(name: str) -> str:
-    """[Addr.Loc.City] / "x" / `x` -> the bare identifier (quoting keeps dots and spaces literal)."""
-    if len(name) >= 2 and (name[0], name[-1]) in {("[", "]"), ('"', '"'), ("`", "`")}:
-        return name[1:-1]
-    return name
+def _decode_identifier(name: str) -> Optional[str]:
+    """SQL-quoted identifier -> its bare value ([a]]b] -> a]b, "a""b" -> a"b, `a``b` -> a`b)."""
+    for open_, close in (("[", "]"), ('"', '"'), ("`", "`")):
+        if len(name) >= 2 and name[0] == open_ and name[-1] == close:
+            return name[1:-1].replace(close * 2, close)
+    return None
 
 
 def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: dict
                     ) -> tuple[list[dict], list[str]]:
-    """Map name pairs to column FQNs: exact name first, then a UNIQUE case-insensitive match.
+    """Map name pairs to column FQNs.
 
-    Returns (columnsLineage entries, human-readable rejections). A pair is rejected when either
-    column is absent from the entity or matches several columns case-insensitively — pushing a
-    guess would attach lineage to the wrong column.
+    Order: the name exactly as written; then its SQL-decoded form (so a literal column named
+    ``[x]`` wins over ``x``); then a UNIQUE case-insensitive match of either. A pair is rejected
+    when a column is absent or ambiguous — pushing a guess would attach lineage to the wrong column.
     """
     def index(entity: dict) -> tuple[dict, dict]:
         exact, folded = {}, {}
@@ -198,12 +265,16 @@ def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: d
         return exact, folded
 
     def find(name: str, idx: tuple[dict, dict]) -> Optional[str]:
-        name = _unquote(name)
         exact, folded = idx
-        if name in exact:
-            return exact[name]
-        hits = folded.get(name.lower(), [])
-        return hits[0] if len(hits) == 1 else None
+        candidates = [name] + [d for d in (_decode_identifier(name),) if d is not None]
+        for c in candidates:
+            if c in exact:
+                return exact[c]
+        for c in candidates:
+            hits = folded.get(c.lower(), [])
+            if len(hits) == 1:
+                return hits[0]
+        return None
 
     up_idx, down_idx = index(up_entity), index(down_entity)
     by_target: dict[str, set[str]] = {}
@@ -218,47 +289,163 @@ def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: d
     return [{"fromColumns": sorted(s), "toColumn": t} for t, s in sorted(by_target.items())], rejected
 
 
+# --------------------------------------------------------------------------- merge (no I/O)
+
+
+def _contributor_line(names: list[str]) -> str:
+    return MARKER_PREFIX + json.dumps(names, ensure_ascii=False)
+
+
+def _merge_description(description: Optional[str], contributors: set[str]) -> Optional[str]:
+    lines = (description or "").splitlines()
+    idx = next((i for i, line in enumerate(lines) if line.startswith(MARKER_PREFIX)), None)
+    if idx is None:
+        names = sorted(contributors)[:MAX_CONTRIBUTORS]
+        return "\n".join(lines + [_contributor_line(names)]) if names else description
+    try:
+        known = json.loads(lines[idx][len(MARKER_PREFIX):])
+        if not isinstance(known, list) or not all(isinstance(n, str) for n in known):
+            raise ValueError
+    except ValueError:
+        logger.warning("contributor marker line is not valid JSON; leaving it untouched")
+        return description
+    merged = sorted(set(known) | contributors)
+    if len(merged) > MAX_CONTRIBUTORS:
+        logger.warning("more than %d contributing procedures; list truncated", MAX_CONTRIBUTORS)
+        merged = (sorted(set(known)) + sorted(contributors - set(known)))[:MAX_CONTRIBUTORS]
+    lines[idx] = _contributor_line(merged)
+    return "\n".join(lines)
+
+
 def merge_details(existing: Optional[dict], ours: list[dict], contributors: set[str]) -> dict:
-    """Union our column lineage and contributor note into the edge's existing lineageDetails.
+    """Add our column lineage and contributor marker to the edge's existing lineageDetails.
 
-    Everything already on the edge is kept (sqlQuery, source, pipeline, other columns, other
-    description text); our entries only ever add fromColumns. The description carries one
-    marker line listing contributing procedures, extended in place on later runs.
+    Every existing field and every existing ``columnsLineage`` entry is kept verbatim (including
+    several entries for one target and their ``function``). A mapping of ours that an existing
+    entry already covers is not repeated; otherwise it is added to the existing entry for that
+    target WITHOUT a ``function`` — an entry describing e.g. ``UPPER(x)`` is never extended with
+    unrelated inputs — or appended as a new entry.
     """
-    details = {k: v for k, v in (existing or {}).items() if k not in _SERVER_FIELDS}
-    by_target: dict[str, dict] = {}
-    for entry in details.get("columnsLineage") or []:
-        by_target[entry["toColumn"]] = dict(entry, fromColumns=list(entry.get("fromColumns") or []))
+    details = {k: v for k, v in (existing or {}).items() if k not in _NOT_DETAILS}
+    entries = [dict(e, fromColumns=list(e.get("fromColumns") or []))
+               for e in details.get("columnsLineage") or []]
     for entry in ours:
-        cur = by_target.setdefault(entry["toColumn"], {"toColumn": entry["toColumn"], "fromColumns": []})
-        cur["fromColumns"] = sorted(set(cur["fromColumns"]) | set(entry["fromColumns"]))
-    if by_target:
-        details["columnsLineage"] = [by_target[t] for t in sorted(by_target)]
-
-    lines = (details.get("description") or "").splitlines()
-    ours_line = [i for i, line in enumerate(lines) if line.startswith(DESCRIPTION_MARKER)]
-    known = set()
-    if ours_line:
-        known = {p.strip() for p in lines[ours_line[0]][len(DESCRIPTION_MARKER):].split(",") if p.strip()}
-    marker = DESCRIPTION_MARKER + ", ".join(sorted(known | contributors))
-    if ours_line:
-        lines[ours_line[0]] = marker
-    else:
-        lines.append(marker)
-    details["description"] = "\n".join(lines)
+        target = entry["toColumn"]
+        covered = {f for e in entries if e.get("toColumn") == target for f in e["fromColumns"]}
+        new = sorted(set(entry["fromColumns"]) - covered)
+        if not new:
+            continue
+        plain = next((e for e in entries if e.get("toColumn") == target and not e.get("function")), None)
+        if plain is not None:
+            plain["fromColumns"] = plain["fromColumns"] + new
+        else:
+            entries.append({"fromColumns": new, "toColumn": target})
+    if entries:
+        details["columnsLineage"] = entries
+    description = _merge_description(details.get("description"), contributors)
+    if description is not None:
+        details["description"] = description
     details.setdefault("source", "QueryLineage")
     return details
 
 
 def _normalized(details: Optional[dict]) -> str:
-    d = {k: v for k, v in (details or {}).items() if k not in _SERVER_FIELDS}
-    cols = d.get("columnsLineage") or []
+    """Order-insensitive fingerprint of details, ignoring server-managed fields."""
+    d = {k: v for k, v in (details or {}).items() if k not in _NOT_DETAILS}
     d["columnsLineage"] = sorted(
-        ({**c, "fromColumns": sorted(c.get("fromColumns") or [])} for c in cols), key=lambda c: c["toColumn"])
+        json.dumps({**c, "fromColumns": sorted(c.get("fromColumns") or [])}, sort_keys=True)
+        for c in d.get("columnsLineage") or [])
     return json.dumps(d, sort_keys=True)
 
 
-# --------------------------------------------------------------------------- push
+def edge_details_from_response(body: Optional[dict]) -> Optional[dict]:
+    """The lineageDetails of a getLineageEdge response, or None when the edge carries none.
+
+    OpenMetadata 2.0.x returns them FLAT under "edge" ({"edge": {"columnsLineage": ...}});
+    older payloads nest them under "edge.lineageDetails". Both shapes are accepted, and every
+    field except the edge's endpoints and server timestamps is kept — including ones this
+    version does not know — so a round trip cannot silently drop them.
+    """
+    edge = (body or {}).get("edge", body) or {}
+    if isinstance(edge.get("lineageDetails"), dict):
+        return edge["lineageDetails"] or None
+    details = {k: v for k, v in edge.items() if k not in _NOT_DETAILS}
+    return details or None
+
+
+# --------------------------------------------------------------------------- OpenMetadata I/O
+
+
+def fqn_part(name: str) -> str:
+    """OpenMetadata FQN quoting: a segment containing '.' is wrapped in double quotes."""
+    if "." in name and not (name.startswith('"') and name.endswith('"')):
+        return f'"{name}"'
+    return name
+
+
+class Catalog:
+    """Table lookups with one shared HTTP session and a per-run cache.
+
+    ``table()`` returns the entity (with columns), ``None`` when the table does not exist or its
+    name is ambiguous, and raises LookupFailed when OpenMetadata could not be asked.
+    """
+
+    def __init__(self, config: OpenMetadataConfig):
+        self.base_url = config.server.rstrip("/")
+        self.session = requests.Session()
+        if config.token:
+            self.session.headers["Authorization"] = f"Bearer {config.token}"
+        self._tables: dict[str, Optional[dict]] = {}
+        self.ambiguous: set[str] = set()
+
+    def _get(self, path: str, **params) -> requests.Response:
+        try:
+            resp = self.session.get(f"{self.base_url}{path}", params=params or None, timeout=30)
+        except requests.RequestException as e:
+            raise LookupFailed(f"GET {path}: {e}") from e
+        if resp.status_code not in (200, 404):
+            raise LookupFailed(f"GET {path}: HTTP {resp.status_code} {resp.text[:200]}")
+        return resp
+
+    def _by_fqn(self, fqn: str) -> Optional[dict]:
+        resp = self._get(f"/v1/tables/name/{quote(fqn, safe='')}", fields="columns")
+        return resp.json() if resp.status_code == 200 else None
+
+    def table(self, fqn: str) -> Optional[dict]:
+        if fqn in self._tables:
+            return self._tables[fqn]
+        entity = self._by_fqn(fqn)
+        if entity is None:
+            # The catalog may store another case (SQL Server is usually case-insensitive): accept a
+            # search hit only when exactly one table matches case-insensitively, and re-read it by
+            # its canonical FQN so its columns are present.
+            escaped = fqn.replace("\\", "\\\\").replace('"', '\\"')
+            resp = self._get("/v1/search/query", q=f'fullyQualifiedName:"{escaped}"',
+                             index="table_search_index", size=10)
+            hits = (resp.json().get("hits", {}).get("hits", []) if resp.status_code == 200 else [])
+            names = {h.get("_source", {}).get("fullyQualifiedName", "") for h in hits}
+            matches = sorted(n for n in names if n.lower() == fqn.lower())
+            if len(matches) == 1:
+                entity = self._by_fqn(matches[0])
+            elif len(matches) > 1:
+                self.ambiguous.add(fqn)
+        self._tables[fqn] = entity
+        return entity
+
+    def edge_details(self, from_id: str, to_id: str) -> Optional[dict]:
+        resp = self._get(f"/v1/lineage/getLineageEdge/{from_id}/{to_id}")
+        return edge_details_from_response(resp.json()) if resp.status_code == 200 else None
+
+    def put_edge(self, payload: dict) -> bool:
+        try:
+            resp = self.session.put(f"{self.base_url}/v1/lineage", json=payload, timeout=30)
+        except requests.RequestException as e:
+            logger.error("PUT /v1/lineage failed: %s", e)
+            return False
+        if resp.status_code not in (200, 201):
+            logger.error("PUT /v1/lineage: HTTP %d %s", resp.status_code, resp.text[:500])
+            return False
+        return True
 
 
 @dataclass
@@ -268,91 +455,91 @@ class PushResult:
     failed: int = 0
     unresolved_tables: set[str] = field(default_factory=set)
     rejected_columns: list[str] = field(default_factory=list)
+    lookup_errors: list[str] = field(default_factory=list)
+
+    def exit_code(self) -> int:
+        if self.failed or self.lookup_errors:
+            return EXIT_FAILED
+        if self.unresolved_tables or self.rejected_columns:
+            return EXIT_INCOMPLETE
+        return EXIT_OK
 
 
-def _resolve_table(client: OpenMetadataClient, service: str, ref: TableRef) -> Optional[dict]:
-    """Table entity whose FQN matches exactly (case-insensitively). A search hit for another
-    table — the lookup's fallback can return one — is treated as not found."""
-    fqn = ".".join(p for p in (service, ref.database, ref.schema, ref.table) if p)
-    entity = client.lookup_table(fqn)
-    if entity and entity.get("fullyQualifiedName", "").lower() == fqn.lower():
-        return entity
-    return None
+@dataclass
+class _Group:
+    columns: dict[str, set[str]] = field(default_factory=dict)   # toColumn fqn -> fromColumn fqns
+    contributors: set[str] = field(default_factory=set)
 
 
-# lineageDetails keys; getLineageEdge in OpenMetadata 2.0.x returns them FLAT under "edge"
-# ({"edge": {"columnsLineage": [...], "source": ...}}), older payloads nest them under
-# "edge.lineageDetails". Both shapes are accepted; an edge with none of these keys has no details.
-_DETAIL_KEYS = {"sqlQuery", "columnsLineage", "pipeline", "description", "source", "assetEdges",
-                "tempLineageTables", "createdAt", "createdBy", "updatedAt", "updatedBy"}
-
-
-def edge_details_from_response(body: Optional[dict]) -> Optional[dict]:
-    """The lineageDetails of a getLineageEdge response, or None when the edge carries none."""
-    edge = (body or {}).get("edge", body) or {}
-    if isinstance(edge.get("lineageDetails"), dict):
-        return edge["lineageDetails"]
-    details = {k: v for k, v in edge.items() if k in _DETAIL_KEYS}
-    return details or None
-
-
-def _get_edge_details(client: OpenMetadataClient, from_id: str, to_id: str) -> Optional[dict]:
-    url = f"{client.base_url}/v1/lineage/getLineageEdge/{from_id}/{to_id}"
-    resp = requests.get(url, headers=client._headers(), timeout=30)
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    return edge_details_from_response(resp.json())
-
-
-def push(client: OpenMetadataClient, service: str, plans: list[EdgePlan]) -> PushResult:
+def push(catalog: Catalog, service: str, plans: list[EdgePlan], column_lineage: bool = True) -> PushResult:
     result = PushResult()
+    groups: dict[tuple[str, str], _Group] = {}
     for plan in plans:
-        up = _resolve_table(client, service, plan.upstream)
-        down = _resolve_table(client, service, plan.downstream)
-        for ref, entity in ((plan.upstream, up), (plan.downstream, down)):
-            if entity is None:
-                result.unresolved_tables.add(ref.display())
-        if up is None or down is None:
+        ends = []
+        for ref in (plan.upstream, plan.downstream):
+            fqn = ".".join(fqn_part(p) for p in (service, ref.database, ref.schema, ref.table) if p)
+            try:
+                entity = catalog.table(fqn)
+                if entity is None:
+                    result.unresolved_tables.add(
+                        ref.display() + (" (ambiguous)" if fqn in catalog.ambiguous else ""))
+            except LookupFailed as e:
+                result.lookup_errors.append(str(e))
+                entity = None
+            ends.append(entity)
+        up, down = ends
+        if up is None or down is None or up["id"] == down["id"]:
             continue
-        ours, rejected = resolve_columns(plan.column_pairs, up, down)
-        result.rejected_columns += [f"{plan.upstream.display()} -> {plan.downstream.display()}: {r}"
-                                    for r in rejected]
+        group = groups.setdefault((up["id"], down["id"]), _Group())
+        group.contributors |= plan.contributors
+        if column_lineage:
+            ours, rejected = resolve_columns(plan.column_pairs, up, down)
+            result.rejected_columns += [f"{plan.upstream.display()} -> {plan.downstream.display()}: {r}"
+                                        for r in rejected]
+            for entry in ours:
+                group.columns.setdefault(entry["toColumn"], set()).update(entry["fromColumns"])
+
+    for (up_id, down_id), g in groups.items():
+        ours = [{"fromColumns": sorted(s), "toColumn": t} for t, s in sorted(g.columns.items())]
         try:
-            existing = _get_edge_details(client, up["id"], down["id"])
-            merged = merge_details(existing, ours, plan.contributors)
-            if existing is not None and _normalized(existing) == _normalized(merged):
-                result.unchanged += 1
-                continue
-            payload = {"edge": {"fromEntity": {"id": up["id"], "type": "table"},
-                                "toEntity": {"id": down["id"], "type": "table"},
-                                "lineageDetails": merged}}
-            if client.add_lineage(payload):
-                result.written += 1
-            else:
-                result.failed += 1
-        except requests.RequestException as e:
-            logger.error("edge %s -> %s failed: %s", plan.upstream.display(), plan.downstream.display(), e)
+            existing = catalog.edge_details(up_id, down_id)
+        except LookupFailed as e:
+            result.lookup_errors.append(str(e))
+            continue
+        merged = merge_details(existing, ours, g.contributors)
+        if existing is not None and _normalized(existing) == _normalized(merged):
+            result.unchanged += 1
+            continue
+        payload = {"edge": {"fromEntity": {"id": up_id, "type": "table"},
+                            "toEntity": {"id": down_id, "type": "table"},
+                            "lineageDetails": merged}}
+        if catalog.put_edge(payload):
+            result.written += 1
+        else:
             result.failed += 1
     return result
 
 
 def run(config: SidecarConfig, path: str, dry_run: bool) -> int:
-    """Entry point for ``--from-lineage-json``. Returns the process exit code."""
+    """Entry point for ``--from-lineage-json``. Returns the process exit code:
+    0 all written, 1 unusable input, 2 a lookup or write failed, 3 some tables/columns unresolved."""
+    om = config.openmetadata
     try:
         doc = load_lineage_json(path)
-        plans, report = plan_edges(doc, config.openmetadata.database_name, config.openmetadata.schema_name)
     except LineageJsonError as e:
         logger.error("%s", e)
-        return 1
-    print(render_plan(plans, report))
+        return EXIT_INPUT
+    plans, report = plan_edges(doc, om.database_name, om.schema_name)
+    print(render_plan(plans, report, om.column_lineage))
     if dry_run:
-        return 0
-    result = push(OpenMetadataClient(config.openmetadata), config.openmetadata.service_name, plans)
+        return EXIT_OK
+    result = push(Catalog(om), om.service_name, plans, om.column_lineage)
     print(f"\nOpenMetadata: {result.written} edge(s) written, {result.unchanged} unchanged, "
           f"{result.failed} failed")
+    for e in result.lookup_errors:
+        print("lookup failed: " + e)
     if result.unresolved_tables:
         print("tables not found in OpenMetadata (edges skipped): " + ", ".join(sorted(result.unresolved_tables)))
     for r in result.rejected_columns:
         print("column mapping rejected: " + r)
-    return 2 if result.failed else 0
+    return result.exit_code()

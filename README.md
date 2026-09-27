@@ -282,21 +282,32 @@ What gets pushed — every fact in the file carries a `kind`:
 
 How it writes:
 
-- **All procedures are aggregated per table pair first**, so two procedures that write different
-  columns of the same table end up on one edge with all of their columns.
+- **The whole file is validated first.** A malformed fact stops the run before anything is sent.
+- **Tables are resolved against the catalog before facts are combined.** Names are kept exactly as
+  written until then, so `Customers` and `customers` become one edge only if OpenMetadata says
+  they are one table. A case-insensitive search result is accepted only when exactly one table
+  matches.
+- **All procedures are aggregated per resolved table pair**, so two procedures that write
+  different columns of the same table end up on one edge with all of their columns.
 - **Read-merge-write.** `PUT /v1/lineage` replaces an edge's whole `lineageDetails`, so the sidecar
-  reads the existing edge first and only *adds* to it: lineage from OpenMetadata's own ingestion
-  (or entered by hand) — its `sqlQuery`, `source`, column mappings and description — is kept.
-  A line in the edge description lists the contributing procedures.
+  reads the existing edge first and only *adds* to it. Every existing field and column entry is
+  kept verbatim — lineage from OpenMetadata's own ingestion or entered by hand, including entries
+  with a `function`, which are never extended with other inputs. One description line
+  (`gsp-openmetadata-sidecar contributors v1: [...]`, JSON) lists the contributing procedures.
 - **Reruns are no-ops.** An edge whose merged details equal what the server already has is not
   written again.
-- **No guessing.** Tables must resolve to an entity with that exact FQN (case-insensitively); a
-  column must match exactly or by a *unique* case-insensitive match. Anything else is reported
-  (`tables not found`, `column mapping rejected`) and skipped.
+- **No guessing.** A column matches as written, then as SQL-unquoted (`[a]]b]` is `a]b`), then by a
+  *unique* case-insensitive match. Anything else is reported and skipped.
+- `--no-column-lineage` writes table-level edges only (existing column lineage is kept).
 - `--auto-create-entities` is not supported in this mode yet: ingest the database's metadata
   with OpenMetadata's connector first.
 
-Exit code: `0` success, `1` unreadable input, `2` at least one edge failed to write.
+**Run one writer at a time.** Read-merge-write is not atomic: a sidecar run that overlaps another
+sidecar run, or OpenMetadata's own lineage ingestion, on the same edge can lose one side's
+additions. Schedule the sidecar after OpenMetadata's ingestion has finished.
+
+Exit code: `0` everything written, `1` unusable input (nothing sent), `2` a lookup or write
+failed, `3` finished but some tables were not found or some column mappings were rejected.
 
 ## Backend modes
 
