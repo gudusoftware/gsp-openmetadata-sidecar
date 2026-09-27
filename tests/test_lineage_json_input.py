@@ -75,7 +75,7 @@ def test_malformed_documents_are_rejected_before_anything_is_sent(bad, message):
 
 SCHEMA_PATH = __import__("pathlib").Path(__file__).parent / "fixtures" / "lineage-eval.v1.schema.json"
 MISSING = object()
-VALUES = [MISSING, None, "", "  ", "x", 5, True, [], {}]
+VALUES = [MISSING, None, "", "  ", "x", 5, 1.0, 1.5, True, [], {}]
 
 
 def _set(d, key, value):

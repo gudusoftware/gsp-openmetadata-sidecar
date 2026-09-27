@@ -81,6 +81,13 @@ def _opt_str(value: Any) -> bool:
     return value is None or isinstance(value, str)
 
 
+def _json_integer(value: Any) -> bool:
+    """JSON Schema "integer": any number with a zero fractional part (1 and 1.0), never a boolean."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, int) or (isinstance(value, float) and value.is_integer())
+
+
 def _check(cond: bool, where: str, message: str) -> None:
     if not cond:
         raise LineageJsonError(f"{where}: {message}")
@@ -131,8 +138,7 @@ def _validate_edge(e: Any, where: str) -> None:
     for key in ("role", "transformation", "confidence"):
         _check(_opt_str(e.get(key)), where, f"{key} must be a string or null")
     _check("indirect" not in e or isinstance(e["indirect"], bool), where, "indirect must be a boolean")
-    _check("statementIndex" not in e or (isinstance(e["statementIndex"], int)
-                                         and not isinstance(e["statementIndex"], bool)),
+    _check("statementIndex" not in e or _json_integer(e["statementIndex"]),
            where, "statementIndex must be an integer")
     src, tgt = e["source"], e["target"]
     has = lambda ep, key: _nonblank(ep.get(key))            # present, a string, not blank
