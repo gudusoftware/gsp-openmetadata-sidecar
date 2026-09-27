@@ -57,15 +57,79 @@ TWO_PROCS_ONE_PAIR = doc(
     (doc(("p", [edge("COLUMN", ep(*C, None), ep(*P, "b"))])), "column on both sides"),
     (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "  "))])), "column on both sides"),
     (doc(("p", [edge("ROW_LEVEL", ep(*C, "a"), ep(*P, "b"))])), "exactly one side"),
-    (doc(("p", [edge("TABLE", ep(*C, "a"), ep(*P))])), "must not carry columns"),
-    (doc(("p", [edge("CONSTANT", ep(None, None, None), ep(*P))])), "CONSTANT needs a target column"),
+    (doc(("p", [edge("TABLE", ep(*C, "a"), ep(*P))])), "needs source.table and no columns"),
+    (doc(("p", [edge("CONSTANT", ep(None, None, None), ep(*P))])), "CONSTANT needs no source table/column and a target column"),
     (doc(("p", [edge("TABLE", ep(*C), ep(None, None, None))])), "target.table is required"),
     (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "b"), indirect="yes")])), "must be a boolean"),
-    ({"contract": lj.CONTRACT, "procedures": [{"status": "MAYBE", "edges": []}]}, "status must be"),
+    ({"contract": lj.CONTRACT, "procedures": [{"status": "MAYBE", "edges": [], "issues": []}]}, "status must be"),
+    ({"contract": lj.CONTRACT, "procedures": [{"status": "OK", "edges": []}]}, "'issues' is required"),
+    (doc(("p", [edge(["COLUMN"], ep(*C, "a"), ep(*P, "b"))])), "unknown fact kind"),
+    (doc(("p", [edge("CONSTANT", ep("SalesDB", "dbo", "t"), ep(*P, "b"))])), "CONSTANT needs no source table"),
 ])
 def test_malformed_documents_are_rejected_before_anything_is_sent(bad, message):
     with pytest.raises(lj.LineageJsonError, match=message):
         lj.validate_document(bad)
+
+
+# --- the validator must agree with the published schema on every generated variant ---------------
+
+SCHEMA_PATH = __import__("pathlib").Path(__file__).parent / "fixtures" / "lineage-eval.v1.schema.json"
+MISSING = object()
+VALUES = [MISSING, None, "", "  ", "x", 5, True, [], {}]
+
+
+def _set(d, key, value):
+    d = json.loads(json.dumps(d))
+    if value is MISSING:
+        d.pop(key, None)
+    else:
+        d[key] = value
+    return d
+
+
+def _variants():
+    base_edges = [
+        edge("COLUMN", ep(*C, "a"), ep(*P, "b")),
+        edge("ROW_LEVEL", ep(*C, "a"), ep(*P), role="JOIN", indirect=True),
+        edge("TABLE", ep(*C), ep(*P)),
+        edge("CONSTANT", ep(None, None, None), ep(*P, "b"), role="DERIVED"),
+        edge("CALL", ep(*C), ep(*P), role="LOOKUP"),
+    ]
+    for e in base_edges:
+        for key in ("kind", "role", "indirect", "statementIndex", "confidence", "transformation"):
+            for v in VALUES + ["COLUMN", "ROW_LEVEL", "TABLE", "CONSTANT", "CALL", ["COLUMN"]]:
+                yield doc(("p", [_set(e, key, v)]))
+        for side in ("source", "target"):
+            for field_ in ("database", "schema", "table", "column"):
+                for v in VALUES:
+                    yield doc(("p", [dict(e, **{side: _set(e[side], field_, v)})]))
+            for v in (MISSING, None, "x", []):
+                yield doc(("p", [_set(e, side, v)]))
+    proc = doc(("p", [base_edges[0]]))["procedures"][0]
+    for key in ("status", "edges", "issues", "name", "moduleType", "sourceFile", "error"):
+        for v in VALUES + ["OK", "PARTIAL", "FAILED", [5], [{"reason": 5}]]:
+            yield {"contract": lj.CONTRACT, "procedures": [_set(proc, key, v)]}
+    for key in ("generatedAt", "dialect", "parserVersion"):
+        for v in (5, "x", None):
+            yield {"contract": lj.CONTRACT, "procedures": [], key: v}
+
+
+def test_validator_agrees_with_the_published_schema():
+    jsonschema = pytest.importorskip("jsonschema")
+    validator = jsonschema.Draft202012Validator(json.loads(SCHEMA_PATH.read_text()))
+    disagreements, total = [], 0
+    for d in _variants():
+        total += 1
+        schema_ok = validator.is_valid(d)
+        try:
+            lj.validate_document(d)
+            ours_ok = True
+        except lj.LineageJsonError:
+            ours_ok = False
+        if schema_ok != ours_ok:
+            disagreements.append((schema_ok, json.dumps(d)[:300]))
+    assert total > 500
+    assert disagreements == [], f"{len(disagreements)} of {total} disagree, e.g. {disagreements[:3]}"
 
 
 @responses.activate  # no URL registered: any HTTP call would raise
@@ -158,6 +222,12 @@ def test_a_literal_bracketed_column_name_wins_over_the_unquoted_one():
     assert cols[0]["fromColumns"] == ["s.d.o.a.[x]"]
 
 
+def test_fallback_matching_both_interpretations_is_ambiguous():
+    up, down = entity("s.d.o.a", "[X]", "X"), entity("s.d.o.b", "y")
+    cols, rejected = lj.resolve_columns({("[x]", "y")}, up, down)
+    assert cols == [] and "no unique column" in rejected[0]
+
+
 def test_sql_quoting_and_escapes_are_decoded():
     up = entity("s.d.o.a", "a]b", "Resume")
     down = entity("s.d.o.v", "Addr.Loc.City", 'q"t')
@@ -195,10 +265,13 @@ def test_merge_never_extends_an_entry_that_has_a_function():
     assert merged["columnsLineage"][2] == {"fromColumns": ["s.a.y"], "toColumn": "s.b.x"}
 
 
-def test_merge_does_not_repeat_a_mapping_already_present_and_extends_plain_entries():
-    existing = {"columnsLineage": [{"fromColumns": ["s.a.x"], "toColumn": "s.b.x"}]}
+def test_merge_appends_new_sources_as_their_own_entry_and_never_modifies_existing_ones():
+    existing = {"columnsLineage": [{"fromColumns": ["s.a.x"], "toColumn": "s.b.x", "extra": 1},
+                                   {"fromColumns": None, "toColumn": "s.b.n"}]}
+    snapshot = json.loads(json.dumps(existing))
     merged = lj.merge_details(existing, [{"fromColumns": ["s.a.x", "s.a.z"], "toColumn": "s.b.x"}], {"p"})
-    assert merged["columnsLineage"] == [{"fromColumns": ["s.a.x", "s.a.z"], "toColumn": "s.b.x"}]
+    assert merged["columnsLineage"] == snapshot["columnsLineage"] + [{"fromColumns": ["s.a.z"], "toColumn": "s.b.x"}]
+    assert existing == snapshot            # the input itself is not mutated either
 
 
 def test_merge_is_idempotent_and_contributors_with_commas_round_trip():

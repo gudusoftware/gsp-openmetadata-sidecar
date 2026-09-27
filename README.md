@@ -290,14 +290,16 @@ How it writes:
 - **All procedures are aggregated per resolved table pair**, so two procedures that write
   different columns of the same table end up on one edge with all of their columns.
 - **Read-merge-write.** `PUT /v1/lineage` replaces an edge's whole `lineageDetails`, so the sidecar
-  reads the existing edge first and only *adds* to it. Every existing field and column entry is
-  kept verbatim — lineage from OpenMetadata's own ingestion or entered by hand, including entries
-  with a `function`, which are never extended with other inputs. One description line
+  reads the existing edge first and only *appends* to it: existing fields and `columnsLineage`
+  entries — from OpenMetadata's own ingestion or entered by hand — are never modified; source
+  columns not already present are added as new entries of their own. One description line
   (`gsp-openmetadata-sidecar contributors v1: [...]`, JSON) lists the contributing procedures.
 - **Reruns are no-ops.** An edge whose merged details equal what the server already has is not
   written again.
-- **No guessing.** A column matches as written, then as SQL-unquoted (`[a]]b]` is `a]b`), then by a
-  *unique* case-insensitive match. Anything else is reported and skipped.
+- **No guessing.** A column matches as written, then as SQL-unquoted (`[a]]b]` is `a]b`), then
+  case-insensitively only if that names exactly one column. Anything else is reported and skipped.
+- **Input is validated against the `lineage-eval.v1` contract first**; a malformed file stops the
+  run before any request is made.
 - `--no-column-lineage` writes table-level edges only (existing column lineage is kept).
 - `--auto-create-entities` is not supported in this mode yet: ingest the database's metadata
   with OpenMetadata's connector first.

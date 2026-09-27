@@ -1,0 +1,397 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gudusoft.com/schemas/lineage-eval.v1.schema.json",
+  "title": "lineage-eval.v1",
+  "description": "Output of lineage-eval-cli; input of gsp-openmetadata-sidecar --from-lineage-json. Additive changes only within v1.",
+  "type": "object",
+  "required": [
+    "contract",
+    "procedures"
+  ],
+  "properties": {
+    "contract": {
+      "const": "lineage-eval.v1"
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "dialect": {
+      "type": "string"
+    },
+    "parserVersion": {
+      "type": "string"
+    },
+    "procedures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "status",
+          "edges",
+          "issues"
+        ],
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "db.schema.name when known"
+          },
+          "moduleType": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sourceFile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "enum": [
+              "OK",
+              "PARTIAL",
+              "FAILED"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "kind",
+                "source",
+                "target"
+              ],
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "COLUMN",
+                    "ROW_LEVEL",
+                    "TABLE",
+                    "CONSTANT",
+                    "CALL"
+                  ],
+                  "description": "Shape of the fact. COLUMN: table.column -> table.column (the only kind for OpenMetadata columnsLineage). ROW_LEVEL: exactly one endpoint is a column, the other a row set (WHERE/JOIN influence, COUNT(*)). TABLE: no column on either side. CONSTANT: target column computed from constants, source table is null. CALL: procedure calls procedure (object dependency, not data movement)."
+                },
+                "source": {
+                  "$ref": "#/$defs/endpoint"
+                },
+                "target": {
+                  "$ref": "#/$defs/endpoint"
+                },
+                "role": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "scan-core RoleClassifier: DIRECT, DERIVED, TRANSFORM, AGGREGATE, FILTER, JOIN, CONDITION, UNKNOWN; call rows: LOOKUP"
+                },
+                "indirect": {
+                  "type": "boolean",
+                  "description": "role is FILTER, JOIN or CONDITION: the source decides which rows/branch, it does not supply the value"
+                },
+                "transformation": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "statementIndex": {
+                  "type": "integer"
+                },
+                "confidence": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "allOf": [
+                {
+                  "properties": {
+                    "target": {
+                      "$ref": "#/$defs/withTable"
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "required": [
+                      "kind"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "COLUMN"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "source": {
+                        "allOf": [
+                          {
+                            "$ref": "#/$defs/withTable"
+                          },
+                          {
+                            "$ref": "#/$defs/withColumn"
+                          }
+                        ]
+                      },
+                      "target": {
+                        "$ref": "#/$defs/withColumn"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "required": [
+                      "kind"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "ROW_LEVEL"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "source": {
+                        "$ref": "#/$defs/withTable"
+                      }
+                    },
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "source": {
+                            "$ref": "#/$defs/withColumn"
+                          },
+                          "target": {
+                            "$ref": "#/$defs/noColumn"
+                          }
+                        }
+                      },
+                      {
+                        "properties": {
+                          "source": {
+                            "$ref": "#/$defs/noColumn"
+                          },
+                          "target": {
+                            "$ref": "#/$defs/withColumn"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "if": {
+                    "required": [
+                      "kind"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "TABLE"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "source": {
+                        "allOf": [
+                          {
+                            "$ref": "#/$defs/withTable"
+                          },
+                          {
+                            "$ref": "#/$defs/noColumn"
+                          }
+                        ]
+                      },
+                      "target": {
+                        "$ref": "#/$defs/noColumn"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "required": [
+                      "kind"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "CONSTANT"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "source": {
+                        "allOf": [
+                          {
+                            "$ref": "#/$defs/noTable"
+                          },
+                          {
+                            "$ref": "#/$defs/noColumn"
+                          }
+                        ]
+                      },
+                      "target": {
+                        "$ref": "#/$defs/withColumn"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "required": [
+                      "kind"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "CALL"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "source": {
+                        "allOf": [
+                          {
+                            "$ref": "#/$defs/withTable"
+                          },
+                          {
+                            "$ref": "#/$defs/noColumn"
+                          }
+                        ]
+                      },
+                      "target": {
+                        "$ref": "#/$defs/noColumn"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "issues": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "stage": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "severity": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reasonCode": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "endpoint": {
+      "type": "object",
+      "required": [
+        "table"
+      ],
+      "properties": {
+        "database": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "table": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "null only on the source of a CONSTANT fact"
+        },
+        "column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "withTable": {
+      "required": [
+        "table"
+      ],
+      "properties": {
+        "table": {
+          "type": "string",
+          "pattern": "\\S",
+          "description": "must contain a non-whitespace character; the evaluator normalizes blank names to null"
+        }
+      }
+    },
+    "noTable": {
+      "properties": {
+        "table": {
+          "type": "null"
+        }
+      }
+    },
+    "withColumn": {
+      "required": [
+        "column"
+      ],
+      "properties": {
+        "column": {
+          "type": "string",
+          "pattern": "\\S",
+          "description": "must contain a non-whitespace character; the evaluator normalizes blank names to null"
+        }
+      }
+    },
+    "noColumn": {
+      "properties": {
+        "column": {
+          "type": "null"
+        }
+      }
+    }
+  }
+}

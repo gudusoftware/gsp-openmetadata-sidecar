@@ -21,8 +21,9 @@ the catalog says they are the same table.
 Each edge is written with read-merge-write: OpenMetadata's ``PUT /v1/lineage`` replaces the
 whole ``lineageDetails`` of an edge, so pushing procedure B's columns naively would erase
 procedure A's — and lineage already present (from OpenMetadata's own ingestion or entered by
-hand) must survive. Existing details are kept verbatim; this mode only adds column mappings and
-one contributor marker line. An edge whose merged details equal the server's is not rewritten.
+hand) must survive. Existing fields and column entries are never modified; this mode only appends
+column entries and one contributor marker line. An edge whose merged details equal the server's is
+not rewritten. (Verified in a sequential end-to-end run; not a guarantee under concurrent writers.)
 
 Concurrency: read-merge-write is NOT atomic. Two writers updating the same edge at the same
 time (two sidecar runs, or a sidecar run overlapping OpenMetadata's own lineage ingestion) can
@@ -68,57 +69,88 @@ class LookupFailed(RuntimeError):
 
 
 # --------------------------------------------------------------------------- input validation
+# Mirrors lineage-eval.v1.schema.json rule for rule (tests/test_lineage_json_input.py checks the two
+# agree on generated documents): a file the schema rejects never reaches planning or the network.
 
 
-def _text(value: Any) -> bool:
+def _nonblank(value: Any) -> bool:
     return isinstance(value, str) and value.strip() != ""
 
 
+def _opt_str(value: Any) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _check(cond: bool, where: str, message: str) -> None:
+    if not cond:
+        raise LineageJsonError(f"{where}: {message}")
+
+
 def validate_document(doc: Any) -> None:
-    """Raise LineageJsonError on the first structural problem, before anything is sent."""
+    """Raise LineageJsonError on the first violation of lineage-eval.v1, before anything is sent."""
     if not isinstance(doc, dict) or doc.get("contract") != CONTRACT:
         found = doc.get("contract") if isinstance(doc, dict) else None
         raise LineageJsonError(f"not a {CONTRACT} document (contract={found!r})")
+    for key in ("generatedAt", "dialect", "parserVersion"):
+        _check(key not in doc or isinstance(doc[key], str), key, "must be a string")
     procs = doc.get("procedures")
-    if not isinstance(procs, list):
-        raise LineageJsonError("'procedures' must be a list")
+    _check(isinstance(procs, list), "procedures", "must be a list")
     for i, proc in enumerate(procs):
         where = f"procedures[{i}]"
-        if not isinstance(proc, dict):
-            raise LineageJsonError(f"{where} must be an object")
-        if proc.get("status") is not None and proc["status"] not in STATUSES:
-            raise LineageJsonError(f"{where}.status must be one of {sorted(STATUSES)}")
-        edges = proc.get("edges", [])
-        if not isinstance(edges, list):
-            raise LineageJsonError(f"{where}.edges must be a list")
-        for j, e in enumerate(edges):
+        _check(isinstance(proc, dict), where, "must be an object")
+        for key in ("status", "edges", "issues"):
+            _check(key in proc, where, f"'{key}' is required")
+        _check(isinstance(proc["status"], str) and proc["status"] in STATUSES, where,
+               f"status must be one of {sorted(STATUSES)}")
+        for key in ("name", "moduleType", "sourceFile", "error"):
+            _check(_opt_str(proc.get(key)), where, f"{key} must be a string or null")
+        _check(isinstance(proc["issues"], list), where, "issues must be a list")
+        for j, issue in enumerate(proc["issues"]):
+            _check(isinstance(issue, dict), f"{where}.issues[{j}]", "must be an object")
+            for key in ("stage", "severity", "reasonCode", "reason"):
+                _check(_opt_str(issue.get(key)), f"{where}.issues[{j}]", f"{key} must be a string or null")
+        _check(isinstance(proc["edges"], list), where, "edges must be a list")
+        for j, e in enumerate(proc["edges"]):
             _validate_edge(e, f"{where}.edges[{j}]")
 
 
+def _validate_endpoint(ep: Any, where: str) -> None:
+    _check(isinstance(ep, dict), where, "must be an object")
+    _check("table" in ep, where, "'table' is required")
+    for key in ("database", "schema", "table", "column"):
+        _check(_opt_str(ep.get(key)), where, f"{key} must be a string or null")
+
+
 def _validate_edge(e: Any, where: str) -> None:
-    if not isinstance(e, dict):
-        raise LineageJsonError(f"{where} must be an object")
+    _check(isinstance(e, dict), where, "must be an object")
     kind = e.get("kind")
-    if kind not in KINDS:
-        raise LineageJsonError(f"{where}: unknown fact kind {kind!r}")
-    src, tgt = e.get("source"), e.get("target")
-    if not isinstance(src, dict) or not isinstance(tgt, dict):
-        raise LineageJsonError(f"{where}: source and target must be objects")
-    if "indirect" in e and not isinstance(e["indirect"], bool):
-        raise LineageJsonError(f"{where}.indirect must be a boolean")
-    if not _text(tgt.get("table")):
-        raise LineageJsonError(f"{where}: target.table is required")
-    src_col, tgt_col = _text(src.get("column")), _text(tgt.get("column"))
-    if kind != "CONSTANT" and not _text(src.get("table")):
-        raise LineageJsonError(f"{where}: source.table is required for {kind}")
-    if kind == "COLUMN" and not (src_col and tgt_col):
-        raise LineageJsonError(f"{where}: COLUMN needs a column on both sides")
-    if kind == "ROW_LEVEL" and src_col == tgt_col:
-        raise LineageJsonError(f"{where}: ROW_LEVEL needs a column on exactly one side")
-    if kind in ("TABLE", "CALL") and (src_col or tgt_col):
-        raise LineageJsonError(f"{where}: {kind} must not carry columns")
-    if kind == "CONSTANT" and not tgt_col:
-        raise LineageJsonError(f"{where}: CONSTANT needs a target column")
+    _check(isinstance(kind, str) and kind in KINDS, where, f"unknown fact kind {kind!r}")
+    for side in ("source", "target"):
+        _check(side in e, where, f"'{side}' is required")
+        _validate_endpoint(e[side], f"{where}.{side}")
+    for key in ("role", "transformation", "confidence"):
+        _check(_opt_str(e.get(key)), where, f"{key} must be a string or null")
+    _check("indirect" not in e or isinstance(e["indirect"], bool), where, "indirect must be a boolean")
+    _check("statementIndex" not in e or (isinstance(e["statementIndex"], int)
+                                         and not isinstance(e["statementIndex"], bool)),
+           where, "statementIndex must be an integer")
+    src, tgt = e["source"], e["target"]
+    has = lambda ep, key: _nonblank(ep.get(key))            # present, a string, not blank
+    absent = lambda ep, key: ep.get(key) is None            # null or missing
+    _check(has(tgt, "table"), where, "target.table is required")
+    if kind == "COLUMN":
+        _check(has(src, "table") and has(src, "column") and has(tgt, "column"), where,
+               "COLUMN needs a table and a column on both sides")
+    elif kind == "ROW_LEVEL":
+        _check(has(src, "table"), where, "ROW_LEVEL needs source.table")
+        _check((has(src, "column") and absent(tgt, "column")) or (absent(src, "column") and has(tgt, "column")),
+               where, "ROW_LEVEL needs a column on exactly one side")
+    elif kind in ("TABLE", "CALL"):
+        _check(has(src, "table") and absent(src, "column") and absent(tgt, "column"), where,
+               f"{kind} needs source.table and no columns")
+    elif kind == "CONSTANT":
+        _check(absent(src, "table") and absent(src, "column") and has(tgt, "column"), where,
+               "CONSTANT needs no source table/column and a target column")
 
 
 def load_lineage_json(path: str) -> dict:
@@ -254,8 +286,9 @@ def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: d
     """Map name pairs to column FQNs.
 
     Order: the name exactly as written; then its SQL-decoded form (so a literal column named
-    ``[x]`` wins over ``x``); then a UNIQUE case-insensitive match of either. A pair is rejected
-    when a column is absent or ambiguous — pushing a guess would attach lineage to the wrong column.
+    ``[x]`` wins over ``x``); then a case-insensitive match, accepted only when both
+    interpretations together match exactly ONE column. A pair is rejected when a column is absent
+    or ambiguous — pushing a guess would attach lineage to the wrong column.
     """
     def index(entity: dict) -> tuple[dict, dict]:
         exact, folded = {}, {}
@@ -270,11 +303,10 @@ def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: d
         for c in candidates:
             if c in exact:
                 return exact[c]
-        for c in candidates:
-            hits = folded.get(c.lower(), [])
-            if len(hits) == 1:
-                return hits[0]
-        return None
+        # fallback: the case-insensitive matches of BOTH interpretations together must name exactly
+        # one column (catalog columns "[X]" and "X" make "[x]" ambiguous)
+        hits = {h for c in candidates for h in folded.get(c.lower(), [])}
+        return hits.pop() if len(hits) == 1 else None
 
     up_idx, down_idx = index(up_entity), index(down_entity)
     by_target: dict[str, set[str]] = {}
@@ -320,25 +352,17 @@ def _merge_description(description: Optional[str], contributors: set[str]) -> Op
 def merge_details(existing: Optional[dict], ours: list[dict], contributors: set[str]) -> dict:
     """Add our column lineage and contributor marker to the edge's existing lineageDetails.
 
-    Every existing field and every existing ``columnsLineage`` entry is kept verbatim (including
-    several entries for one target and their ``function``). A mapping of ours that an existing
-    entry already covers is not repeated; otherwise it is added to the existing entry for that
-    target WITHOUT a ``function`` — an entry describing e.g. ``UPPER(x)`` is never extended with
-    unrelated inputs — or appended as a new entry.
+    Every existing field and every existing ``columnsLineage`` entry is kept verbatim — none is
+    modified, merged or re-ordered. For each target, the source columns no existing entry already
+    covers are appended as ONE new entry of their own; mappings already present are not repeated.
     """
     details = {k: v for k, v in (existing or {}).items() if k not in _NOT_DETAILS}
-    entries = [dict(e, fromColumns=list(e.get("fromColumns") or []))
-               for e in details.get("columnsLineage") or []]
+    entries = list(details.get("columnsLineage") or [])
     for entry in ours:
         target = entry["toColumn"]
-        covered = {f for e in entries if e.get("toColumn") == target for f in e["fromColumns"]}
+        covered = {f for e in entries if e.get("toColumn") == target for f in (e.get("fromColumns") or [])}
         new = sorted(set(entry["fromColumns"]) - covered)
-        if not new:
-            continue
-        plain = next((e for e in entries if e.get("toColumn") == target and not e.get("function")), None)
-        if plain is not None:
-            plain["fromColumns"] = plain["fromColumns"] + new
-        else:
+        if new:
             entries.append({"fromColumns": new, "toColumn": target})
     if entries:
         details["columnsLineage"] = entries
