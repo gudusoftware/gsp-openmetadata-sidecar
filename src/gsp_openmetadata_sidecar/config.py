@@ -16,6 +16,8 @@ DEFAULT_URLS = {
 }
 
 
+INDIRECT_COLUMN_MODES = {"condition", "all", "none"}
+
 @dataclass
 class SQLFlowConfig:
     mode: str = "anonymous"
@@ -48,6 +50,11 @@ class OpenMetadataConfig:
     database_name: Optional[str] = None
     schema_name: str = "dbo"
     column_lineage: bool = True
+    # --from-lineage-json: which indirect column facts (lineage-eval.v1 role) also go into
+    # columnsLineage, labelled in the entry's "function": "condition" = CASE WHEN conditions only,
+    # as OpenMetadata's own parser records them; "all" = also GROUP BY keys and WHERE/JOIN columns
+    # that target a column; "none" = value lineage only. Row-level facts are never column lineage.
+    indirect_columns: str = "condition"
     # Opt-in auto-creation of missing Database / DatabaseSchema / Table
     # entities before lineage emission. Default off preserves byte-for-byte
     # legacy behavior.
@@ -106,6 +113,8 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
         cfg.openmetadata.schema_name = om.get("schema_name", cfg.openmetadata.schema_name)
         if "column_lineage" in om:
             cfg.openmetadata.column_lineage = bool(om["column_lineage"])
+        if "indirect_columns" in om:
+            cfg.openmetadata.indirect_columns = str(om["indirect_columns"])
         if "auto_create_entities" in om:
             cfg.openmetadata.auto_create_entities = bool(om["auto_create_entities"])
         if "on_create_failure" in om:
@@ -137,6 +146,7 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
         "GSP_OM_DATABASE_NAME": ("openmetadata", "database_name"),
         "GSP_OM_SCHEMA_NAME": ("openmetadata", "schema_name"),
         "GSP_COLUMN_LINEAGE": ("openmetadata", "column_lineage"),
+        "GSP_INDIRECT_COLUMNS": ("openmetadata", "indirect_columns"),
         "GSP_OM_AUTO_CREATE_ENTITIES": ("openmetadata", "auto_create_entities"),
         "GSP_OM_ON_CREATE_FAILURE": ("openmetadata", "on_create_failure"),
         "GSP_OM_MAX_ENTITIES_TO_CREATE": ("openmetadata", "max_entities_to_create"),
@@ -160,6 +170,12 @@ def load_config(config_path: Optional[str] = None) -> SidecarConfig:
             setattr(getattr(cfg, section), attr, val)
 
     # --- Validate ---
+    if cfg.openmetadata.indirect_columns not in INDIRECT_COLUMN_MODES:
+        raise ValueError(
+            f"openmetadata.indirect_columns must be one of {sorted(INDIRECT_COLUMN_MODES)}, "
+            f"got {cfg.openmetadata.indirect_columns!r}"
+        )
+
     valid_modes = {"anonymous", "authenticated", "self_hosted", "local_jar"}
     if cfg.sqlflow.mode not in valid_modes:
         raise ValueError(

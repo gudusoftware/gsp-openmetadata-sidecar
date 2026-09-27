@@ -159,6 +159,16 @@ def main():
         help="Emit table-level lineage only.",
     )
 
+    parser.add_argument(
+        "--indirect-columns",
+        choices=["condition", "all", "none"],
+        default=None,
+        help="--from-lineage-json: indirect column facts to push as labelled column lineage. "
+             "condition (default): CASE WHEN conditions, as OpenMetadata's own parser records them; "
+             "all: also GROUP BY keys and WHERE/JOIN columns that target a column; none: value "
+             "lineage only.",
+    )
+
     auto_create_group = parser.add_mutually_exclusive_group()
     auto_create_group.add_argument(
         "--auto-create-entities",
@@ -244,6 +254,8 @@ def main():
         config.openmetadata.schema_name = args.schema_name
     if args.column_lineage is not None:
         config.openmetadata.column_lineage = args.column_lineage
+    if args.indirect_columns is not None:
+        config.openmetadata.indirect_columns = args.indirect_columns
     if args.auto_create_entities is not None:
         config.openmetadata.auto_create_entities = args.auto_create_entities
     if args.on_create_failure is not None:

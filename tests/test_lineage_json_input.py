@@ -154,9 +154,38 @@ def test_two_procedures_on_one_table_pair_become_one_plan_with_all_columns():
     assert len(plans) == 1
     p = plans[0]
     assert p.column_pairs == {("customer_id", "customer_id"), ("customer_name", "display_name"), ("region", "region")}
-    assert p.indirect_pairs == {("credit_limit", "credit_band")}
+    # default indirect_columns="condition": the CASE WHEN condition is pushed, labelled
+    assert p.labelled_pairs == {"CASE WHEN condition": {("credit_limit", "credit_band")}}
+    assert p.indirect_pairs == set()
     assert p.contributors == {"SalesDB.dbo.usp_ProfileNames", "SalesDB.dbo.usp_ProfileRegion"}
     assert report.skipped_self_loop == 1
+
+
+V = ("Analytics", "dbo", "vw")
+INDIRECT_KINDS = doc(("p", [
+    edge("COLUMN", ep(*C, "credit_limit"), ep(*V, "band"), role="CONDITION", indirect=True),
+    edge("COLUMN", ep(*C, "region"), ep(*V, "total"), role="GROUP_BY", indirect=True),
+    edge("COLUMN", ep(*C, "created"), ep(*V, "cnt"), role="FILTER", indirect=True),
+    edge("COLUMN", ep(*C, "customer_id"), ep(*V, "cnt"), role="JOIN", indirect=True),
+    edge("ROW_LEVEL", ep(*C, "customer_id"), ep(*V), role="JOIN", indirect=True),   # no target column
+]))
+
+
+@pytest.mark.parametrize("mode, labelled, kept_out", [
+    ("condition", {"CASE WHEN condition": {("credit_limit", "band")}},
+     {("region", "total"), ("created", "cnt"), ("customer_id", "cnt")}),
+    ("all", {"CASE WHEN condition": {("credit_limit", "band")}, "GROUP BY key": {("region", "total")},
+             "filter (WHERE/HAVING)": {("created", "cnt")}, "join condition": {("customer_id", "cnt")}}, set()),
+    ("none", {}, {("credit_limit", "band"), ("region", "total"), ("created", "cnt"), ("customer_id", "cnt")}),
+])
+def test_indirect_columns_decides_which_indirect_facts_become_labelled_column_lineage(mode, labelled, kept_out):
+    plans, _ = lj.plan_edges(INDIRECT_KINDS, indirect_columns=mode)
+    assert len(plans) == 1 and plans[0].column_pairs == set()
+    assert plans[0].labelled_pairs == labelled
+    assert plans[0].indirect_pairs == kept_out          # the ROW_LEVEL fact is never a column mapping
+    text = lj.render_plan(plans, lj.PlanReport())
+    for label in labelled:
+        assert f"({label})" in text
 
 
 def test_constant_and_call_facts_are_never_planned():
@@ -274,6 +303,21 @@ def test_merge_never_extends_an_entry_that_has_a_function():
     assert merged["columnsLineage"][2] == {"fromColumns": ["s.a.y"], "toColumn": "s.b.x"}
 
 
+def test_a_labelled_mapping_is_its_own_entry_and_never_repeats_a_covered_one():
+    ours = [{"fromColumns": ["s.a.c"], "toColumn": "s.b.band", "function": "CASE WHEN condition"},
+            {"fromColumns": ["s.a.x"], "toColumn": "s.b.x", "function": "CASE WHEN condition"}]
+    merged = lj.merge_details(EXISTING, ours, {"p"})
+    assert merged["columnsLineage"] == EXISTING["columnsLineage"] + [
+        {"fromColumns": ["s.a.c"], "toColumn": "s.b.band", "function": "CASE WHEN condition"}]  # s.a.x covered
+
+
+def test_a_column_that_is_both_value_and_condition_is_recorded_once_as_value():
+    both = [{"fromColumns": ["s.a.d"], "toColumn": "s.b.d", "function": "CASE WHEN condition"},
+            {"fromColumns": ["s.a.d"], "toColumn": "s.b.d"}]            # e.g. CASE WHEN d > 0 THEN d END
+    for ours in (both, both[::-1]):
+        assert lj.merge_details({}, ours, {"p"})["columnsLineage"] == [{"fromColumns": ["s.a.d"], "toColumn": "s.b.d"}]
+
+
 def test_merge_appends_new_sources_as_their_own_entry_and_never_modifies_existing_ones():
     existing = {"columnsLineage": [{"fromColumns": ["s.a.x"], "toColumn": "s.b.x", "extra": 1},
                                    {"fromColumns": None, "toColumn": "s.b.n"}]}
@@ -364,6 +408,21 @@ def test_push_merges_with_existing_edge_then_is_a_no_op_on_rerun():
     again = lj.push(catalog(), "svc", plans)
     assert (again.written, again.unchanged) == (0, 1)
     assert len(put.calls) == 1
+
+
+@responses.activate
+def test_push_sends_the_case_when_condition_labelled_when_native_lineage_lacks_it():
+    _profile_tables()
+    responses.get(f"{OM}/v1/lineage/getLineageEdge/customers/customer_profile",
+                  json={"edge": {"source": "QueryLineage", "sqlQuery": "native"}})
+    put = responses.put(f"{OM}/v1/lineage", json={})
+    lj.push(catalog(), "svc", lj.plan_edges(TWO_PROCS_ONE_PAIR)[0])
+    sent = json.loads(put.calls[0].request.body)["edge"]["lineageDetails"]["columnsLineage"]
+    labelled = [c for c in sent if "function" in c]
+    assert labelled == [{"fromColumns": ["svc.SalesDB.dbo.customers.credit_limit"],
+                         "toColumn": "svc.SalesDB.dbo.customer_profile.credit_band",
+                         "function": "CASE WHEN condition"}]
+    assert len(sent) == 4                                # 3 value mappings + the labelled one
 
 
 @responses.activate
@@ -485,3 +544,19 @@ def test_no_column_lineage_reaches_the_push_from_the_cli(tmp_path, monkeypatch):
     monkeypatch.setattr(lj, "push", fake_push)
     assert _cli(monkeypatch, tmp_path, "--no-column-lineage") == 0
     assert seen == {"column_lineage": False}
+
+
+def test_indirect_columns_option_reaches_the_plan_from_the_cli(tmp_path, monkeypatch, capsys):
+    assert _cli(monkeypatch, tmp_path, "--dry-run") == 0
+    assert "credit_limit -> credit_band   (CASE WHEN condition)" in capsys.readouterr().out
+    assert _cli(monkeypatch, tmp_path, "--dry-run", "--indirect-columns", "none") == 0
+    assert "credit_limit -> credit_band   (indirect: table-level only" in capsys.readouterr().out
+
+
+def test_indirect_columns_is_validated_and_read_from_the_environment(tmp_path, monkeypatch):
+    from gsp_openmetadata_sidecar.config import load_config
+    monkeypatch.setenv("GSP_INDIRECT_COLUMNS", "all")
+    assert load_config(None).openmetadata.indirect_columns == "all"
+    monkeypatch.setenv("GSP_INDIRECT_COLUMNS", "everything")
+    with pytest.raises(ValueError, match="indirect_columns"):
+        load_config(None)

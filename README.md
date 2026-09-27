@@ -276,9 +276,23 @@ What gets pushed — every fact in the file carries a `kind`:
 
 | kind | pushed as |
 |---|---|
-| `COLUMN` | a column mapping in `columnsLineage`, unless it is *indirect* (a `WHERE`/`JOIN`/`CASE WHEN` column that decides rows or branch rather than supplying the value): those give a table-level edge only |
-| `ROW_LEVEL`, `TABLE` | a table-level edge only |
+| `COLUMN` | a column mapping in `columnsLineage`. An *indirect* one (role `CONDITION`, `GROUP_BY`, `FILTER` or `JOIN`: the column decides a branch, a group or which rows count, rather than supplying the value) follows `--indirect-columns`, below |
+| `ROW_LEVEL`, `TABLE` | a table-level edge only (a row-level fact has no target column) |
 | `CONSTANT`, `CALL` | nothing (no source table / a procedure call, not data movement) |
+
+`--indirect-columns` decides which indirect column facts also become column mappings. Each such
+mapping is its own `columnsLineage` entry whose `function` names its type — OpenMetadata shows it
+as "SQL Function" when you click the column-level edge:
+
+| `--indirect-columns` | pushed as labelled column mappings | `function` text |
+|---|---|---|
+| `condition` (default) | `CASE WHEN` conditions only — what OpenMetadata's own parser records too (`credit_limit -> credit_band`) | `CASE WHEN condition` |
+| `all` | also `GROUP BY` keys and `WHERE`/`JOIN` columns that target a column (e.g. a `COUNT(*)` over filtered rows) | `GROUP BY key`, `filter (WHERE/HAVING)`, `join condition` |
+| `none` | nothing — value lineage only | |
+
+Indirect facts not pushed as column mappings still give the table-level edge. A mapping already
+present on the edge — with any `function` or none — is never added twice; a column that is both a
+value and a condition is recorded once, as a value.
 
 How it writes:
 
@@ -618,6 +632,7 @@ All settings can be provided via CLI flags, environment variables, or a YAML con
 | Database name | `--database-name` | `GSP_OM_DATABASE_NAME` | `openmetadata.database_name` |
 | Schema name | `--schema-name` | `GSP_OM_SCHEMA_NAME` | `openmetadata.schema_name` |
 | Column lineage | `--column-lineage` / `--no-column-lineage` | `GSP_COLUMN_LINEAGE` | `openmetadata.column_lineage` |
+| Indirect column facts (`--from-lineage-json`) | `--indirect-columns condition\|all\|none` | `GSP_INDIRECT_COLUMNS` | `openmetadata.indirect_columns` |
 
 ### Advanced
 

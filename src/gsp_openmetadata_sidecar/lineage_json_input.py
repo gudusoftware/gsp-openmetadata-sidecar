@@ -47,6 +47,11 @@ logger = logging.getLogger(__name__)
 CONTRACT = "lineage-eval.v1"
 KINDS = {"COLUMN", "ROW_LEVEL", "TABLE", "CONSTANT", "CALL"}
 INDIRECT_ROLES = {"FILTER", "JOIN", "CONDITION", "GROUP_BY"}
+# The "function" text of a pushed indirect column mapping, per role; which roles are pushed at all
+# depends on openmetadata.indirect_columns (condition / all / none).
+INDIRECT_LABELS = {"CONDITION": "CASE WHEN condition", "GROUP_BY": "GROUP BY key",
+                   "FILTER": "filter (WHERE/HAVING)", "JOIN": "join condition"}
+PUSHED_INDIRECT = {"condition": {"CONDITION"}, "all": set(INDIRECT_LABELS), "none": set()}
 STATUSES = {"OK", "PARTIAL", "FAILED"}
 
 # One description line records the contributing procedures as a JSON array, so names containing
@@ -192,6 +197,7 @@ class EdgePlan:
     upstream: TableRef
     downstream: TableRef
     column_pairs: set[tuple[str, str]] = field(default_factory=set)
+    labelled_pairs: dict[str, set[tuple[str, str]]] = field(default_factory=dict)  # function -> pairs
     indirect_pairs: set[tuple[str, str]] = field(default_factory=set)   # kept out of columnsLineage
     contributors: set[str] = field(default_factory=set)
 
@@ -211,9 +217,14 @@ def _table(endpoint: dict, default_db: Optional[str], default_schema: Optional[s
                     endpoint["table"])
 
 
-def plan_edges(doc: dict, default_db: Optional[str] = None,
-               default_schema: Optional[str] = None) -> tuple[list[EdgePlan], PlanReport]:
-    """Aggregate the facts of every procedure per as-written table pair (doc must be validated)."""
+def plan_edges(doc: dict, default_db: Optional[str] = None, default_schema: Optional[str] = None,
+               indirect_columns: str = "condition") -> tuple[list[EdgePlan], PlanReport]:
+    """Aggregate the facts of every procedure per as-written table pair (doc must be validated).
+
+    Value lineage becomes plain column mappings. An indirect COLUMN fact becomes a mapping labelled
+    with its role (INDIRECT_LABELS) when ``indirect_columns`` pushes that role, and is otherwise
+    kept out of columnsLineage; it still contributes the table-level edge."""
+    pushed = PUSHED_INDIRECT[indirect_columns]
     report = PlanReport()
     plans: dict[tuple[TableRef, TableRef], EdgePlan] = {}
     for proc in doc["procedures"]:
@@ -244,7 +255,11 @@ def plan_edges(doc: dict, default_db: Optional[str] = None,
             if indirect is None:
                 indirect = edge.get("role") in INDIRECT_ROLES
             if indirect:
-                plan.indirect_pairs.add(pair)
+                role = edge.get("role")
+                if role in pushed:
+                    plan.labelled_pairs.setdefault(INDIRECT_LABELS[role], set()).add(pair)
+                else:
+                    plan.indirect_pairs.add(pair)
                 continue
             plan.column_pairs.add(pair)
     ordered = sorted(plans.values(), key=lambda p: (p.downstream.display(), p.upstream.display()))
@@ -262,10 +277,15 @@ def render_plan(plans: list[EdgePlan], report: PlanReport, column_lineage: bool 
         lines.append("procedures the evaluator could not analyze: " + ", ".join(report.failed_procedures))
     for p in plans:
         lines.append("")
+        labelled = sum(len(v) for v in p.labelled_pairs.values())
         lines.append(f"{p.upstream.display()} -> {p.downstream.display()}   "
-                     f"[{len(p.column_pairs)} column mapping(s); from {', '.join(sorted(p.contributors))}]")
+                     f"[{len(p.column_pairs) + labelled} column mapping(s); "
+                     f"from {', '.join(sorted(p.contributors))}]")
         for src, tgt in sorted(p.column_pairs):
             lines.append(f"    {src} -> {tgt}")
+        for label, pairs in sorted(p.labelled_pairs.items()):
+            for src, tgt in sorted(pairs):
+                lines.append(f"    {src} -> {tgt}   ({label})")
         for src, tgt in sorted(p.indirect_pairs):
             lines.append(f"    {src} -> {tgt}   (indirect: table-level only, not in columnsLineage)")
     return "\n".join(lines)
@@ -282,9 +302,9 @@ def _decode_identifier(name: str) -> Optional[str]:
     return None
 
 
-def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: dict
-                    ) -> tuple[list[dict], list[str]]:
-    """Map name pairs to column FQNs.
+def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: dict,
+                    function: Optional[str] = None) -> tuple[list[dict], list[str]]:
+    """Map name pairs to column FQNs (entries carry ``function`` when one is given).
 
     Order: the name exactly as written; then its SQL-decoded form (so a literal column named
     ``[x]`` wins over ``x``); then a case-insensitive match, accepted only when both
@@ -319,7 +339,14 @@ def resolve_columns(pairs: set[tuple[str, str]], up_entity: dict, down_entity: d
             rejected.append(f"{src} -> {tgt} (no unique column for {', '.join(missing)})")
             continue
         by_target.setdefault(tgt_fqn, set()).add(src_fqn)
-    return [{"fromColumns": sorted(s), "toColumn": t} for t, s in sorted(by_target.items())], rejected
+    return [_entry(sorted(s), t, function) for t, s in sorted(by_target.items())], rejected
+
+
+def _entry(from_columns: list[str], to_column: str, function: Optional[str]) -> dict:
+    entry = {"fromColumns": from_columns, "toColumn": to_column}
+    if function:
+        entry["function"] = function
+    return entry
 
 
 # --------------------------------------------------------------------------- merge (no I/O)
@@ -355,16 +382,19 @@ def merge_details(existing: Optional[dict], ours: list[dict], contributors: set[
 
     Every existing field and every existing ``columnsLineage`` entry is kept verbatim — none is
     modified, merged or re-ordered. For each target, the source columns no existing entry already
-    covers are appended as ONE new entry of their own; mappings already present are not repeated.
+    covers are appended as ONE new entry of their own (one per ``function`` label); mappings already
+    present — with any label or none — are not repeated. Unlabelled (value) entries go first, so a
+    column that is both a value and, say, a CASE WHEN condition is recorded once, as a value.
     """
     details = {k: v for k, v in (existing or {}).items() if k not in _NOT_DETAILS}
     entries = list(details.get("columnsLineage") or [])
-    for entry in ours:
+    for entry in sorted(ours, key=lambda e: (e.get("function") is not None, e.get("function") or "",
+                                             e["toColumn"])):
         target = entry["toColumn"]
         covered = {f for e in entries if e.get("toColumn") == target for f in (e.get("fromColumns") or [])}
         new = sorted(set(entry["fromColumns"]) - covered)
         if new:
-            entries.append({"fromColumns": new, "toColumn": target})
+            entries.append(_entry(new, target, entry.get("function")))
     if entries:
         details["columnsLineage"] = entries
     description = _merge_description(details.get("description"), contributors)
@@ -492,7 +522,8 @@ class PushResult:
 
 @dataclass
 class _Group:
-    columns: dict[str, set[str]] = field(default_factory=dict)   # toColumn fqn -> fromColumn fqns
+    # (toColumn fqn, function label or None) -> fromColumn fqns
+    columns: dict[tuple[str, Optional[str]], set[str]] = field(default_factory=dict)
     contributors: set[str] = field(default_factory=set)
 
 
@@ -518,14 +549,15 @@ def push(catalog: Catalog, service: str, plans: list[EdgePlan], column_lineage: 
         group = groups.setdefault((up["id"], down["id"]), _Group())
         group.contributors |= plan.contributors
         if column_lineage:
-            ours, rejected = resolve_columns(plan.column_pairs, up, down)
-            result.rejected_columns += [f"{plan.upstream.display()} -> {plan.downstream.display()}: {r}"
-                                        for r in rejected]
-            for entry in ours:
-                group.columns.setdefault(entry["toColumn"], set()).update(entry["fromColumns"])
+            for function, pairs in [(None, plan.column_pairs)] + sorted(plan.labelled_pairs.items()):
+                ours, rejected = resolve_columns(pairs, up, down, function)
+                result.rejected_columns += [f"{plan.upstream.display()} -> {plan.downstream.display()}: {r}"
+                                            for r in rejected]
+                for entry in ours:
+                    group.columns.setdefault((entry["toColumn"], function), set()).update(entry["fromColumns"])
 
     for (up_id, down_id), g in groups.items():
-        ours = [{"fromColumns": sorted(s), "toColumn": t} for t, s in sorted(g.columns.items())]
+        ours = [_entry(sorted(s), t, f) for (t, f), s in sorted(g.columns.items(), key=lambda kv: (kv[0][0], kv[0][1] or ""))]
         try:
             existing = catalog.edge_details(up_id, down_id)
         except LookupFailed as e:
@@ -554,7 +586,7 @@ def run(config: SidecarConfig, path: str, dry_run: bool) -> int:
     except LineageJsonError as e:
         logger.error("%s", e)
         return EXIT_INPUT
-    plans, report = plan_edges(doc, om.database_name, om.schema_name)
+    plans, report = plan_edges(doc, om.database_name, om.schema_name, om.indirect_columns)
     print(render_plan(plans, report, om.column_lineage))
     if dry_run:
         return EXIT_OK
