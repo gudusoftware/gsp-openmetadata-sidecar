@@ -33,6 +33,7 @@ lose one writer's additions. Run one writer at a time, after OpenMetadata's inge
 from __future__ import annotations
 
 import json
+import re
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -106,6 +107,10 @@ def validate_document(doc: Any) -> None:
         raise LineageJsonError(f"not a {CONTRACT} document (contract={found!r})")
     for key in ("generatedAt", "dialect", "parserVersion"):
         _check(key not in doc or isinstance(doc[key], str), key, "must be a string")
+    _check(_opt_str(doc.get("defaultDatabase")), "defaultDatabase", "must be a string or null")
+    _check("settingsHash" not in doc or (isinstance(doc["settingsHash"], str)
+                                        and re.search(r"^[0-9a-f]{64}$", doc["settingsHash"]) is not None),
+           "settingsHash", "must be 64 lowercase hex characters")
     procs = doc.get("procedures")
     _check(isinstance(procs, list), "procedures", "must be a list")
     for i, proc in enumerate(procs):

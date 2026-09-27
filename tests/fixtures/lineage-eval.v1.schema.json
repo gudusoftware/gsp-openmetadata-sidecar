@@ -19,6 +19,18 @@
     "dialect": {
       "type": "string"
     },
+    "defaultDatabase": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "--default-database of the run: fills in only the database names the scripts leave open (a script's USE and explicit names win)"
+    },
+    "settingsHash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of dialect|defaultDatabase|encoding (absent values empty): reports produced with different settings differ here"
+    },
     "parserVersion": {
       "type": "string"
     },
