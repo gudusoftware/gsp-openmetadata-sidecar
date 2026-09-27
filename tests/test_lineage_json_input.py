@@ -175,12 +175,21 @@ def test_names_differing_only_in_case_stay_separate_until_the_catalog_decides():
     assert len(plans) == 2      # a case-sensitive database may really have both tables
 
 
-def test_aggregate_pairs_are_pushed_but_labelled():
+def test_the_aggregated_value_is_column_lineage_and_group_by_keys_are_not():
+    # the evaluator marks GROUP BY keys GROUP_BY/indirect; only SUM's input is AGGREGATE
+    vw = ep("Analytics", "dbo", "vw", "TotalRevenue")
     plans, _ = lj.plan_edges(doc(("v", [
-        edge("COLUMN", ep("Sales", "dbo", "Invoices", "InvoiceDate"),
-             ep("Analytics", "dbo", "vw", "TotalRevenue"), role="AGGREGATE")])))
-    assert plans[0].column_pairs == plans[0].aggregate_pairs == {("InvoiceDate", "TotalRevenue")}
-    assert "AGGREGATE" in lj.render_plan(plans, lj.PlanReport())
+        edge("COLUMN", ep("Sales", "dbo", "Invoices", "Amount"), vw, role="AGGREGATE"),
+        edge("COLUMN", ep("Sales", "dbo", "Invoices", "InvoiceDate"), vw, role="GROUP_BY", indirect=True)])))
+    assert plans[0].column_pairs == {("Amount", "TotalRevenue")}
+    assert plans[0].indirect_pairs == {("InvoiceDate", "TotalRevenue")}
+    text = lj.render_plan(plans, lj.PlanReport())
+    assert "Amount -> TotalRevenue\n" in text + "\n" and "grouping" not in text
+
+
+def test_group_by_is_indirect_when_the_flag_is_absent():
+    plans, _ = lj.plan_edges(doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "b"), role="GROUP_BY")])))
+    assert plans[0].column_pairs == set() and plans[0].indirect_pairs == {("a", "b")}
 
 
 def test_indirect_falls_back_to_role_when_the_flag_is_absent():

@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 CONTRACT = "lineage-eval.v1"
 KINDS = {"COLUMN", "ROW_LEVEL", "TABLE", "CONSTANT", "CALL"}
-INDIRECT_ROLES = {"FILTER", "JOIN", "CONDITION"}
+INDIRECT_ROLES = {"FILTER", "JOIN", "CONDITION", "GROUP_BY"}
 STATUSES = {"OK", "PARTIAL", "FAILED"}
 
 # One description line records the contributing procedures as a JSON array, so names containing
@@ -192,7 +192,6 @@ class EdgePlan:
     upstream: TableRef
     downstream: TableRef
     column_pairs: set[tuple[str, str]] = field(default_factory=set)
-    aggregate_pairs: set[tuple[str, str]] = field(default_factory=set)  # labelled AGGREGATE
     indirect_pairs: set[tuple[str, str]] = field(default_factory=set)   # kept out of columnsLineage
     contributors: set[str] = field(default_factory=set)
 
@@ -248,8 +247,6 @@ def plan_edges(doc: dict, default_db: Optional[str] = None,
                 plan.indirect_pairs.add(pair)
                 continue
             plan.column_pairs.add(pair)
-            if edge.get("role") == "AGGREGATE":
-                plan.aggregate_pairs.add(pair)
     ordered = sorted(plans.values(), key=lambda p: (p.downstream.display(), p.upstream.display()))
     return ordered, report
 
@@ -268,9 +265,7 @@ def render_plan(plans: list[EdgePlan], report: PlanReport, column_lineage: bool 
         lines.append(f"{p.upstream.display()} -> {p.downstream.display()}   "
                      f"[{len(p.column_pairs)} column mapping(s); from {', '.join(sorted(p.contributors))}]")
         for src, tgt in sorted(p.column_pairs):
-            flag = "   (AGGREGATE: may be a grouping/filter influence, see evaluator report)" \
-                if (src, tgt) in p.aggregate_pairs else ""
-            lines.append(f"    {src} -> {tgt}{flag}")
+            lines.append(f"    {src} -> {tgt}")
         for src, tgt in sorted(p.indirect_pairs):
             lines.append(f"    {src} -> {tgt}   (indirect: table-level only, not in columnsLineage)")
     return "\n".join(lines)

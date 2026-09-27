@@ -95,7 +95,7 @@
                     "string",
                     "null"
                   ],
-                  "description": "scan-core RoleClassifier: DIRECT, DERIVED, TRANSFORM, AGGREGATE, FILTER, JOIN, CONDITION, UNKNOWN; call rows: LOOKUP"
+                  "description": "scan-core RoleClassifier: DIRECT, DERIVED, TRANSFORM, AGGREGATE, GROUP_BY, FILTER, JOIN, CONDITION, UNKNOWN; call rows: LOOKUP"
                 },
                 "indirect": {
                   "type": "boolean",
