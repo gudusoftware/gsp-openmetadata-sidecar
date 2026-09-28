@@ -16,6 +16,13 @@
       "type": "string",
       "format": "date-time"
     },
+    "input": {
+      "enum": [
+        "sql",
+        "sharded"
+      ],
+      "description": "What was analysed: sql = .sql scripts (--sql-dir); sharded = a sqlflow-sharded bundle from sqlflow-exporter (--sharded-dir), whose names are as the exporter writes them (for SQL Server: databases, tables and table columns upper-cased)"
+    },
     "dialect": {
       "type": "string"
     },
@@ -24,12 +31,12 @@
         "string",
         "null"
       ],
-      "description": "--default-database of the run: fills in only the database names the scripts leave open (a script's USE and explicit names win)"
+      "description": "--default-database of the run: fills in only the database names the scripts leave open (a script's USE and explicit names win); always null for a sharded bundle, whose modules carry their own database"
     },
     "settingsHash": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",
-      "description": "SHA-256 of dialect|defaultDatabase|encoding (absent values empty): reports produced with different settings differ here"
+      "description": "SHA-256 of input|dialect|defaultDatabase|encoding (absent values empty): reports produced with different settings differ here"
     },
     "parserVersion": {
       "type": "string"
@@ -61,7 +68,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Where the unit's SQL came from: file:<path>[#L<first>-<last>] for .sql input; sharded:<shard>:<offset>:<length> (a byte range of the bundle's source/<shard>.source.jsonl) for a sharded bundle; null for a module the bundle lists without a body"
           },
           "status": {
             "enum": [
@@ -111,7 +119,7 @@
                 },
                 "indirect": {
                   "type": "boolean",
-                  "description": "role is FILTER, JOIN or CONDITION: the source decides which rows/branch, it does not supply the value"
+                  "description": "role is GROUP_BY, FILTER, JOIN or CONDITION: the source decides which rows/group/branch, it does not supply the value"
                 },
                 "transformation": {
                   "type": [

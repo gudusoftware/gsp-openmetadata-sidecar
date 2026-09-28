@@ -55,6 +55,7 @@ INDIRECT_LABELS = {"CONDITION": "CASE WHEN condition", "GROUP_BY": "GROUP BY key
 PUSHED_INDIRECT = {"condition": {"CONDITION"}, "all": set(INDIRECT_LABELS), "none": set()}
 _OUR_LABELS = set(INDIRECT_LABELS.values())
 STATUSES = {"OK", "PARTIAL", "FAILED"}
+INPUTS = {"sql", "sharded"}   # --sql-dir / --sharded-dir; absent in reports from before the field
 
 # One description line records the contributing procedures as a JSON array, so names containing
 # commas or quotes round-trip. A line with this prefix that is not valid JSON (e.g. edited by hand)
@@ -107,6 +108,8 @@ def validate_document(doc: Any) -> None:
         raise LineageJsonError(f"not a {CONTRACT} document (contract={found!r})")
     for key in ("generatedAt", "dialect", "parserVersion"):
         _check(key not in doc or isinstance(doc[key], str), key, "must be a string")
+    _check("input" not in doc or (isinstance(doc["input"], str) and doc["input"] in INPUTS),
+           "input", f"must be one of {sorted(INPUTS)}")
     _check(_opt_str(doc.get("defaultDatabase")), "defaultDatabase", "must be a string or null")
     _check("settingsHash" not in doc or (isinstance(doc["settingsHash"], str)
                                         and re.search(r"^[0-9a-f]{64}$", doc["settingsHash"]) is not None),

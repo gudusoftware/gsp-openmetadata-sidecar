@@ -109,8 +109,8 @@ def _variants():
     for key in ("status", "edges", "issues", "name", "moduleType", "sourceFile", "error"):
         for v in VALUES + ["OK", "PARTIAL", "FAILED", [5], [{"reason": 5}]]:
             yield {"contract": lj.CONTRACT, "procedures": [_set(proc, key, v)]}
-    for key in ("generatedAt", "dialect", "parserVersion", "defaultDatabase", "settingsHash"):
-        for v in (5, "x", None, "", "a" * 64, "A" * 64, "a" * 63, ["x"]):
+    for key in ("input", "generatedAt", "dialect", "parserVersion", "defaultDatabase", "settingsHash"):
+        for v in (5, "x", None, "", "a" * 64, "A" * 64, "a" * 63, ["x"], "sql", "sharded", ["sql"], "SQL"):
             yield {"contract": lj.CONTRACT, "procedures": [], key: v}
 
 
