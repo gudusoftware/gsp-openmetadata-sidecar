@@ -7,7 +7,9 @@ talks to the configured OpenMetadata server.
 Contract (every fact carries a ``kind``):
 
 - ``COLUMN``    table.column -> table.column. Becomes ``columnsLineage`` unless ``indirect``
-                (FILTER / JOIN / CONDITION: decides rows or branch, does not supply the value).
+                (GROUP_BY / FILTER / JOIN / CONDITION: decides rows, group or branch, does not
+                supply the value; ``indirect`` must agree with ``role``). Indirect columns follow
+                ``--indirect-columns``: labelled with a ``function`` text, or not pushed.
 - ``ROW_LEVEL`` one side is a table's row set. Table-level edge only.
 - ``TABLE``     no column on either side. Table-level edge only.
 - ``CONSTANT``  target computed from constants; no source table. Not pushed.
@@ -152,6 +154,13 @@ def _validate_edge(e: Any, where: str) -> None:
     for key in ("role", "transformation", "confidence"):
         _check(_opt_str(e.get(key)), where, f"{key} must be a string or null")
     _check("indirect" not in e or isinstance(e["indirect"], bool), where, "indirect must be a boolean")
+    # indirect is true exactly for the indirect roles (lineage-eval.v1 enforces it): a CONDITION
+    # column flagged indirect=false would otherwise be pushed as a plain value mapping
+    if "indirect" in e:
+        expected = e.get("role") in INDIRECT_ROLES
+        _check(e["indirect"] == expected, where,
+               f"indirect must be {str(expected).lower()} for role {e.get('role')!r} "
+               f"(true exactly for {', '.join(sorted(INDIRECT_ROLES))})")
     _check("statementIndex" not in e or _json_integer(e["statementIndex"]),
            where, "statementIndex must be an integer")
     src, tgt = e["source"], e["target"]
@@ -478,9 +487,28 @@ class Catalog:
             raise LookupFailed(f"GET {path}: HTTP {resp.status_code} {resp.text[:200]}")
         return resp
 
+    @staticmethod
+    def _object(resp: requests.Response, what: str) -> dict:
+        """The JSON object of a 200 response. Anything else (an HTML error page served with 200, a
+        truncated body, a list where an object belongs) is a LookupFailed, so ``push`` records it
+        against that edge and carries on, instead of the whole run dying mid-push."""
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise LookupFailed(f"{what}: the response is not JSON ({str(e)[:100]})") from e
+        if not isinstance(body, dict):
+            raise LookupFailed(f"{what}: expected a JSON object, got {type(body).__name__}")
+        return body
+
     def _by_fqn(self, fqn: str) -> Optional[dict]:
-        resp = self._get(f"/v1/tables/name/{quote(fqn, safe='')}", fields="columns")
-        return resp.json() if resp.status_code == 200 else None
+        path = f"/v1/tables/name/{quote(fqn, safe='')}"
+        resp = self._get(path, fields="columns")
+        if resp.status_code != 200:
+            return None
+        entity = self._object(resp, f"GET {path}")
+        if not isinstance(entity.get("id"), str) or not isinstance(entity.get("columns", []), list):
+            raise LookupFailed(f"GET {path}: not a table entity (no id, or columns not a list)")
+        return entity
 
     def table(self, fqn: str) -> Optional[dict]:
         if fqn in self._tables:
@@ -493,8 +521,14 @@ class Catalog:
             escaped = fqn.replace("\\", "\\\\").replace('"', '\\"')
             resp = self._get("/v1/search/query", q=f'fullyQualifiedName:"{escaped}"',
                              index="table_search_index", size=10)
-            hits = (resp.json().get("hits", {}).get("hits", []) if resp.status_code == 200 else [])
-            names = {h.get("_source", {}).get("fullyQualifiedName", "") for h in hits}
+            hits = []
+            if resp.status_code == 200:
+                outer = self._object(resp, "GET /v1/search/query").get("hits", {})
+                hits = outer.get("hits", []) if isinstance(outer, dict) else None
+                if not isinstance(hits, list):
+                    raise LookupFailed("GET /v1/search/query: no hits list in the response")
+            names = {h["_source"].get("fullyQualifiedName", "") for h in hits
+                     if isinstance(h, dict) and isinstance(h.get("_source"), dict)}
             matches = sorted(n for n in names if n.lower() == fqn.lower())
             if len(matches) == 1:
                 entity = self._by_fqn(matches[0])
@@ -504,8 +538,14 @@ class Catalog:
         return entity
 
     def edge_details(self, from_id: str, to_id: str) -> Optional[dict]:
-        resp = self._get(f"/v1/lineage/getLineageEdge/{from_id}/{to_id}")
-        return edge_details_from_response(resp.json()) if resp.status_code == 200 else None
+        path = f"/v1/lineage/getLineageEdge/{from_id}/{to_id}"
+        resp = self._get(path)
+        if resp.status_code != 200:
+            return None
+        body = self._object(resp, f"GET {path}")
+        if not isinstance(body.get("edge", body), dict):
+            raise LookupFailed(f"GET {path}: the edge is not a JSON object")
+        return edge_details_from_response(body)
 
     def put_edge(self, payload: dict) -> bool:
         try:

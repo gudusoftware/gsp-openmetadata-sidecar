@@ -54,6 +54,13 @@ TWO_PROCS_ONE_PAIR = doc(
     ({"contract": "lineage-eval.v2", "procedures": []}, "not a lineage-eval.v1"),
     ({"contract": lj.CONTRACT, "procedures": {}}, "must be a list"),
     (doc(("p", [edge("SOMETHING", ep(*C, "a"), ep(*P, "b"))])), "unknown fact kind"),
+    # review round 22 P1: an indirect role flagged indirect=false must not become a value mapping
+    (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "b"), role="CONDITION", indirect=False)])),
+     "indirect must be true for role 'CONDITION'"),
+    (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "b"), role="DIRECT", indirect=True)])),
+     "indirect must be false for role 'DIRECT'"),
+    (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "b"), role=None, indirect=True)])),
+     "indirect must be false for role None"),
     (doc(("p", [edge("COLUMN", ep(*C, None), ep(*P, "b"))])), "column on both sides"),
     (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "  "))])), "column on both sides"),
     (doc(("p", [edge("ROW_LEVEL", ep(*C, "a"), ep(*P, "b"))])), "exactly one side"),
@@ -105,6 +112,9 @@ def _variants():
                     yield doc(("p", [dict(e, **{side: _set(e[side], field_, v)})]))
             for v in (MISSING, None, "x", []):
                 yield doc(("p", [_set(e, side, v)]))
+    for role in ("GROUP_BY", "FILTER", "JOIN", "CONDITION", "DIRECT", "AGGREGATE", None, "x"):
+        for indirect in (True, False, MISSING):
+            yield doc(("p", [_set(edge("COLUMN", ep(*C, "a"), ep(*P, "b"), role=role), "indirect", indirect)]))
     proc = doc(("p", [base_edges[0]]))["procedures"][0]
     for key in ("status", "edges", "issues", "name", "moduleType", "sourceFile", "error"):
         for v in VALUES + ["OK", "PARTIAL", "FAILED", [5], [{"reason": 5}]]:
@@ -492,6 +502,47 @@ def test_a_lookup_failure_is_a_failure_not_a_missing_table():
     plans, _ = lj.plan_edges(TWO_PROCS_ONE_PAIR)
     result = lj.push(catalog(), "svc", plans)
     assert result.unresolved_tables == set() and len(result.lookup_errors) == 1
+    assert result.exit_code() == lj.EXIT_FAILED
+
+
+@pytest.mark.parametrize("path, body", [
+    ("/v1/tables/name/" + quote("svc.SalesDB.dbo.customers", safe=""), "<html>gateway error</html>"),
+    ("/v1/tables/name/" + quote("svc.SalesDB.dbo.customers", safe=""), "[1, 2]"),
+    ("/v1/tables/name/" + quote("svc.SalesDB.dbo.customers", safe=""), '{"name": "no id"}'),
+])
+@responses.activate
+def test_a_malformed_table_response_is_a_lookup_failure(path, body):
+    responses.get(f"{OM}{path}", body=body, status=200)
+    with pytest.raises(lj.LookupFailed):
+        catalog().table("svc.SalesDB.dbo.customers")
+
+
+@pytest.mark.parametrize("body", ["<html>oops</html>", '{"hits": []}', '{"hits": {"hits": {}}}'])
+@responses.activate
+def test_a_malformed_search_response_is_a_lookup_failure(body):
+    responses.get(f"{OM}/v1/tables/name/{quote('svc.SalesDB.dbo.customers', safe='')}", status=404)
+    responses.get(f"{OM}/v1/search/query", body=body, status=200)
+    with pytest.raises(lj.LookupFailed):
+        catalog().table("svc.SalesDB.dbo.customers")
+
+
+@responses.activate
+def test_a_malformed_response_after_a_write_fails_that_edge_only_and_reports():
+    # review round 22 P2: a 200 that is not JSON used to escape as an exception mid-push, after
+    # earlier edges were already written, skipping the summary and the exit code
+    O = ("SalesDB", "dbo", "orders")
+    _profile_tables()
+    _table("svc.SalesDB.dbo.orders", "order_id", id_="orders")
+    responses.get(f"{OM}/v1/lineage/getLineageEdge/customers/customer_profile", status=404)
+    responses.get(f"{OM}/v1/lineage/getLineageEdge/orders/customer_profile", body="<html>502</html>", status=200)
+    put = responses.put(f"{OM}/v1/lineage", json={})
+    plans, _ = lj.plan_edges(doc(
+        ("a", [edge("COLUMN", ep(*C, "customer_id"), ep(*P, "customer_id"))]),
+        ("b", [edge("COLUMN", ep(*O, "order_id"), ep(*P, "customer_id"))])))
+    result = lj.push(catalog(), "svc", plans)
+    assert (result.written, len(result.lookup_errors)) == (1, 1), result
+    assert "orders/customer_profile" in result.lookup_errors[0] and "not JSON" in result.lookup_errors[0]
+    assert len(put.calls) == 1
     assert result.exit_code() == lj.EXIT_FAILED
 
 

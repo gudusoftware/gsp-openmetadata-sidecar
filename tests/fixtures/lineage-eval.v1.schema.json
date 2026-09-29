@@ -119,7 +119,7 @@
                 },
                 "indirect": {
                   "type": "boolean",
-                  "description": "role is GROUP_BY, FILTER, JOIN or CONDITION: the source decides which rows/group/branch, it does not supply the value"
+                  "description": "true exactly when role is GROUP_BY, FILTER, JOIN or CONDITION (enforced below): the source decides which rows/group/branch, it does not supply the value. May be omitted; a reader then derives it from role"
                 },
                 "transformation": {
                   "type": [
@@ -298,6 +298,58 @@
                       },
                       "target": {
                         "$ref": "#/$defs/noColumn"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "required": [
+                      "indirect"
+                    ],
+                    "properties": {
+                      "indirect": {
+                        "const": true
+                      }
+                    }
+                  },
+                  "then": {
+                    "required": [
+                      "role"
+                    ],
+                    "properties": {
+                      "role": {
+                        "enum": [
+                          "GROUP_BY",
+                          "FILTER",
+                          "JOIN",
+                          "CONDITION"
+                        ]
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "required": [
+                      "role",
+                      "indirect"
+                    ],
+                    "properties": {
+                      "role": {
+                        "enum": [
+                          "GROUP_BY",
+                          "FILTER",
+                          "JOIN",
+                          "CONDITION"
+                        ]
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "indirect": {
+                        "const": true
                       }
                     }
                   }
