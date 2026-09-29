@@ -19,8 +19,9 @@ def ep(db, schema, table, column=None):
     return {"database": db, "schema": schema, "table": table, "column": column}
 
 
-def edge(kind, source, target, role="DIRECT", indirect=None):
-    e = {"kind": kind, "source": source, "target": target, "role": role}
+def edge(kind, source, target, role="DIRECT", indirect=None, origin="STATIC", verification="VERIFIED"):
+    e = {"kind": kind, "source": source, "target": target, "role": role,
+         "origin": origin, "verification": verification}
     if indirect is not None:
         e["indirect"] = indirect
     return e
@@ -72,6 +73,12 @@ TWO_PROCS_ONE_PAIR = doc(
     ({"contract": lj.CONTRACT, "procedures": [{"status": "OK", "edges": []}]}, "'issues' is required"),
     (doc(("p", [edge(["COLUMN"], ep(*C, "a"), ep(*P, "b"))])), "unknown fact kind"),
     (doc(("p", [edge("CONSTANT", ep("SalesDB", "dbo", "t"), ep(*P, "b"))])), "CONSTANT needs no source table"),
+    # origin and verification are required; a STATIC fact is always VERIFIED (B2)
+    (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "b"), origin=None)])), "origin must be one of"),
+    (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "b"), origin="INLINE")])), "origin must be one of"),
+    (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "b"), verification="MAYBE")])), "verification must be one of"),
+    (doc(("p", [edge("COLUMN", ep(*C, "a"), ep(*P, "b"), verification="UNVERIFIED")])),
+     "a STATIC fact is always VERIFIED"),
 ])
 def test_malformed_documents_are_rejected_before_anything_is_sent(bad, message):
     with pytest.raises(lj.LineageJsonError, match=message):
@@ -103,9 +110,14 @@ def _variants():
         edge("CALL", ep(*C), ep(*P), role="LOOKUP"),
     ]
     for e in base_edges:
-        for key in ("kind", "role", "indirect", "statementIndex", "confidence", "transformation"):
-            for v in VALUES + ["COLUMN", "ROW_LEVEL", "TABLE", "CONSTANT", "CALL", ["COLUMN"]]:
+        for key in ("kind", "role", "indirect", "statementIndex", "confidence", "transformation",
+                    "origin", "verification"):
+            for v in VALUES + ["COLUMN", "ROW_LEVEL", "TABLE", "CONSTANT", "CALL", ["COLUMN"],
+                               "STATIC", "DYNAMIC", "VERIFIED", "UNVERIFIED", ["STATIC"]]:
                 yield doc(("p", [_set(e, key, v)]))
+        for origin in ("STATIC", "DYNAMIC"):
+            for verification in ("VERIFIED", "UNVERIFIED"):
+                yield doc(("p", [_set(_set(e, "origin", origin), "verification", verification)]))
         for side in ("source", "target"):
             for field_ in ("database", "schema", "table", "column"):
                 for v in VALUES:
@@ -119,6 +131,20 @@ def _variants():
     for key in ("status", "edges", "issues", "name", "moduleType", "sourceFile", "error"):
         for v in VALUES + ["OK", "PARTIAL", "FAILED", [5], [{"reason": 5}]]:
             yield {"contract": lj.CONTRACT, "procedures": [_set(proc, key, v)]}
+    # the evaluator's dynamic SQL report (B2): not pushed, but held to the schema like the rest
+    pset = {"parameters": {"@sourcedb": "'QSP'"}, "callers": ["db.dbo.p_a"], "status": "RESOLVED", "facts": 1,
+            "sql": "INSERT INTO dbo.RECON_QSP (a) SELECT a FROM dbo.src", "reason": None}
+    site = {"line": 5, "column": 5, "kind": "EXEC_STRING", "gspStatus": "RESOLVED", "status": "PARTIAL",
+            "reason": "x", "parameterSets": [pset]}
+    for v in (MISSING, None, [], [site], [5], "x", {}):
+        yield {"contract": lj.CONTRACT, "procedures": [_set(proc, "dynamicSql", v)]}
+    for key in ("line", "column", "kind", "gspStatus", "status", "reason", "parameterSets"):
+        for v in VALUES + [1.0, 1.5, True, -1, "RESOLVED", "UNRESOLVED", "CONDITIONAL", [pset], [5]]:
+            yield {"contract": lj.CONTRACT, "procedures": [_set(proc, "dynamicSql", [_set(site, key, v)])]}
+    for key in ("parameters", "callers", "status", "facts", "sql", "reason"):
+        for v in VALUES + [0, 2.0, 1.5, -1, True, {"@a": "'x'"}, {"@a": 5}, ["db.dbo.p"], [5], "UNCONFIRMED"]:
+            s2 = dict(site, parameterSets=[_set(pset, key, v)])
+            yield {"contract": lj.CONTRACT, "procedures": [_set(proc, "dynamicSql", [s2])]}
     for key in ("input", "generatedAt", "dialect", "parserVersion", "defaultDatabase", "settingsHash"):
         for v in (5, "x", None, "", "a" * 64, "A" * 64, "a" * 63, ["x"], "sql", "sharded", ["sql"], "SQL"):
             yield {"contract": lj.CONTRACT, "procedures": [], key: v}
@@ -205,6 +231,32 @@ def test_constant_and_call_facts_are_never_planned():
     ])))
     assert plans == []
     assert (report.skipped_constant, report.skipped_call) == (1, 1)
+
+
+def test_unverified_dynamic_facts_are_listed_and_never_planned():
+    # a dynamic SQL fact whose endpoints the metadata did not confirm is a candidate: reported, not pushed;
+    # a verified dynamic fact is lineage like any other
+    plans, report = lj.plan_edges(doc(("usp_dyn", [
+        edge("COLUMN", ep(*C, "region"), ep(*P, "region"), origin="DYNAMIC", verification="UNVERIFIED"),
+        edge("COLUMN", ep(*C, "customer_id"), ep(*P, "customer_id"), origin="DYNAMIC", verification="VERIFIED"),
+    ])))
+    assert [(p.upstream.table, p.downstream.table, sorted(p.column_pairs)) for p in plans] == [
+        ("customers", "customer_profile", [("customer_id", "customer_id")])]
+    assert report.unverified == ["usp_dyn: SalesDB.dbo.customers.region -> SalesDB.dbo.customer_profile.region (COLUMN)"]
+    assert report.facts_by_kind == {"COLUMN": 1}, "a candidate is no fact"
+    text = lj.render_plan(plans, report)
+    assert "facts by kind: COLUMN=1" in text
+    assert "1 unverified" in text
+    assert "  usp_dyn: SalesDB.dbo.customers.region -> SalesDB.dbo.customer_profile.region (COLUMN)" in text
+
+
+def test_a_table_pair_only_unverified_facts_name_is_not_planned():
+    plans, report = lj.plan_edges(doc(("usp_dyn", [
+        edge("TABLE", ep(*C), ep(*P), origin="DYNAMIC", verification="UNVERIFIED"),
+    ])))
+    assert plans == []
+    assert report.unverified == ["usp_dyn: SalesDB.dbo.customers -> SalesDB.dbo.customer_profile (TABLE)"]
+    assert report.facts_by_kind == {}
 
 
 def test_names_differing_only_in_case_stay_separate_until_the_catalog_decides():

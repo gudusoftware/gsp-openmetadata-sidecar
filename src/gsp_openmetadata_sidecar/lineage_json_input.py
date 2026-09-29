@@ -57,6 +57,9 @@ INDIRECT_LABELS = {"CONDITION": "CASE WHEN condition", "GROUP_BY": "GROUP BY key
 PUSHED_INDIRECT = {"condition": {"CONDITION"}, "all": set(INDIRECT_LABELS), "none": set()}
 _OUR_LABELS = set(INDIRECT_LABELS.values())
 STATUSES = {"OK", "PARTIAL", "FAILED"}
+ORIGINS = {"STATIC", "DYNAMIC"}              # SQL written in the code / built at run time
+VERIFICATIONS = {"VERIFIED", "UNVERIFIED"}   # UNVERIFIED: a dynamic SQL candidate, never pushed
+SITE_STATUSES = {"RESOLVED", "PARTIAL", "UNRESOLVED"}   # a dynamic SQL site's final status (report only)
 INPUTS = {"sql", "sharded"}   # --sql-dir / --sharded-dir; absent in reports from before the field
 
 # One description line records the contributing procedures as a JSON array, so names containing
@@ -135,6 +138,10 @@ def validate_document(doc: Any) -> None:
         _check(isinstance(proc["edges"], list), where, "edges must be a list")
         for j, e in enumerate(proc["edges"]):
             _validate_edge(e, f"{where}.edges[{j}]")
+        # the evaluator's dynamic SQL report: nothing here is pushed, but a file the schema rejects is refused
+        _check("dynamicSql" not in proc or isinstance(proc["dynamicSql"], list), where, "dynamicSql must be a list")
+        for j, site in enumerate(proc.get("dynamicSql") or []):
+            _validate_dynamic_site(site, f"{where}.dynamicSql[{j}]")
 
 
 def _validate_endpoint(ep: Any, where: str) -> None:
@@ -163,6 +170,11 @@ def _validate_edge(e: Any, where: str) -> None:
                f"(true exactly for {', '.join(sorted(INDIRECT_ROLES))})")
     _check("statementIndex" not in e or _json_integer(e["statementIndex"]),
            where, "statementIndex must be an integer")
+    origin, verification = e.get("origin"), e.get("verification")
+    _check(isinstance(origin, str) and origin in ORIGINS, where, f"origin must be one of {sorted(ORIGINS)}")
+    _check(isinstance(verification, str) and verification in VERIFICATIONS, where,
+           f"verification must be one of {sorted(VERIFICATIONS)}")
+    _check(origin != "STATIC" or verification == "VERIFIED", where, "a STATIC fact is always VERIFIED")
     src, tgt = e["source"], e["target"]
     has = lambda ep, key: _nonblank(ep.get(key))            # present, a string, not blank
     absent = lambda ep, key: ep.get(key) is None            # null or missing
@@ -180,6 +192,33 @@ def _validate_edge(e: Any, where: str) -> None:
     elif kind == "CONSTANT":
         _check(absent(src, "table") and absent(src, "column") and has(tgt, "column"), where,
                "CONSTANT needs no source table/column and a target column")
+
+
+def _validate_dynamic_site(site: Any, where: str) -> None:
+    _check(isinstance(site, dict), where, "must be an object")
+    for key in ("line", "column", "status", "parameterSets"):
+        _check(key in site, where, f"'{key}' is required")
+    for key in ("line", "column"):
+        _check(_json_integer(site[key]), where, f"{key} must be an integer")
+    for key in ("kind", "gspStatus", "reason"):
+        _check(_opt_str(site.get(key)), where, f"{key} must be a string or null")
+    _check(isinstance(site["status"], str) and site["status"] in SITE_STATUSES, where,
+           f"status must be one of {sorted(SITE_STATUSES)}")
+    _check(isinstance(site["parameterSets"], list), where, "parameterSets must be a list")
+    for k, ps in enumerate(site["parameterSets"]):
+        at = f"{where}.parameterSets[{k}]"
+        _check(isinstance(ps, dict), at, "must be an object")
+        for key in ("parameters", "status", "facts"):
+            _check(key in ps, at, f"'{key}' is required")
+        _check(isinstance(ps["parameters"], dict) and all(isinstance(v, str) for v in ps["parameters"].values()),
+               at, "parameters must map names to strings")
+        _check("callers" not in ps or (isinstance(ps["callers"], list)
+                                       and all(isinstance(c, str) for c in ps["callers"])),
+               at, "callers must be a list of strings")
+        _check(isinstance(ps["status"], str), at, "status must be a string")
+        _check(_json_integer(ps["facts"]) and ps["facts"] >= 0, at, "facts must be a non-negative integer")
+        for key in ("sql", "reason"):
+            _check(_opt_str(ps.get(key)), at, f"{key} must be a string or null")
 
 
 def load_lineage_json(path: str) -> dict:
@@ -228,6 +267,13 @@ class PlanReport:
     skipped_constant: int = 0
     skipped_call: int = 0
     skipped_self_loop: int = 0
+    unverified: list[str] = field(default_factory=list)   # dynamic SQL candidates, listed, never pushed
+
+
+def _endpoint_text(endpoint: dict) -> str:
+    """An endpoint as written, for the report: db.schema.table.column, parts that are absent left out."""
+    return ".".join(p for p in (endpoint.get("database"), endpoint.get("schema"), endpoint.get("table"),
+                                endpoint.get("column")) if p) or "(constant)"
 
 
 def _table(endpoint: dict, default_db: Optional[str], default_schema: Optional[str]) -> TableRef:
@@ -252,6 +298,10 @@ def plan_edges(doc: dict, default_db: Optional[str] = None, default_schema: Opti
             report.failed_procedures.append(name)
         for edge in proc.get("edges", []):
             kind = edge["kind"]
+            if edge["verification"] == "UNVERIFIED":   # a candidate: listed, never a fact, never pushed
+                report.unverified.append(f"{name}: {_endpoint_text(edge['source'])} -> "
+                                         f"{_endpoint_text(edge['target'])} ({kind})")
+                continue
             report.facts_by_kind[kind] = report.facts_by_kind.get(kind, 0) + 1
             if kind == "CONSTANT":
                 report.skipped_constant += 1
@@ -288,7 +338,11 @@ def render_plan(plans: list[EdgePlan], report: PlanReport, column_lineage: bool 
     lines = [f"{report.procedures} procedure(s), {len(plans)} table pair(s) as written; facts by kind: "
              + ", ".join(f"{k}={v}" for k, v in sorted(report.facts_by_kind.items()))]
     lines.append(f"not pushed: {report.skipped_constant} CONSTANT, {report.skipped_call} CALL, "
-                 f"{report.skipped_self_loop} self-referencing")
+                 f"{report.skipped_self_loop} self-referencing, {len(report.unverified)} unverified")
+    if report.unverified:
+        lines.append("unverified dynamic SQL candidates (not pushed; their endpoints are not confirmed by the "
+                     "metadata):")
+        lines.extend("  " + fact for fact in report.unverified)
     if not column_lineage:
         lines.append("--no-column-lineage: table-level edges only; existing column lineage is kept")
     if report.failed_procedures:

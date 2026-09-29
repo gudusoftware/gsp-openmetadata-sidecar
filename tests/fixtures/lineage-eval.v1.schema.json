@@ -91,7 +91,9 @@
               "required": [
                 "kind",
                 "source",
-                "target"
+                "target",
+                "origin",
+                "verification"
               ],
               "properties": {
                 "kind": {
@@ -135,6 +137,20 @@
                     "string",
                     "null"
                   ]
+                },
+                "origin": {
+                  "enum": [
+                    "STATIC",
+                    "DYNAMIC"
+                  ],
+                  "description": "STATIC: SQL written in the code; DYNAMIC: reconstructed from a statement the code builds at run time (EXEC(@sql), sp_executesql)"
+                },
+                "verification": {
+                  "enum": [
+                    "VERIFIED",
+                    "UNVERIFIED"
+                  ],
+                  "description": "VERIFIED: a static fact, or a dynamic one whose endpoints scan-core resolved against the metadata. UNVERIFIED (dynamic only, enforced below): a candidate, reported apart and never pushed"
                 }
               },
               "allOf": [
@@ -142,6 +158,25 @@
                   "properties": {
                     "target": {
                       "$ref": "#/$defs/withTable"
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "required": [
+                      "origin"
+                    ],
+                    "properties": {
+                      "origin": {
+                        "const": "STATIC"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "verification": {
+                        "const": "VERIFIED"
+                      }
                     }
                   }
                 },
@@ -385,6 +420,105 @@
                     "string",
                     "null"
                   ]
+                }
+              }
+            }
+          },
+          "dynamicSql": {
+            "type": "array",
+            "description": "B2: the unit's dynamic SQL sites (EXEC(@sql), sp_executesql), in source order, each with its final status; absent when the unit has none. A site's line and column (where its statement starts in the unit's text) are, with the unit, its stable identity.",
+            "items": {
+              "type": "object",
+              "required": [
+                "line",
+                "column",
+                "status",
+                "parameterSets"
+              ],
+              "properties": {
+                "line": {
+                  "type": "integer"
+                },
+                "column": {
+                  "type": "integer"
+                },
+                "kind": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "GSP's site kind: EXEC_STRING, SP_EXECUTESQL, ..."
+                },
+                "gspStatus": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "GSP's analysis of the site on its own"
+                },
+                "status": {
+                  "enum": [
+                    "RESOLVED",
+                    "PARTIAL",
+                    "UNRESOLVED"
+                  ],
+                  "description": "Final status. RESOLVED: the statement is known on its own (every relationship GSP found for it is proven), or under every parameter set its callers pass, each giving facts the metadata confirms. PARTIAL: under some of those parameter sets. UNRESOLVED: otherwise. The statistics count this status."
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Why the site is not resolved on its own, and what its callers' parameter sets made of it; null when it is"
+                },
+                "parameterSets": {
+                  "type": "array",
+                  "description": "Each distinct set of literal arguments the unit's callers pass it, and what the site became under it (SDLP's RESOLVE_DYNAMIC)",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "parameters",
+                      "status",
+                      "facts"
+                    ],
+                    "properties": {
+                      "parameters": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "description": "lower-cased parameter name -> the literal as written"
+                      },
+                      "callers": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "status": {
+                        "type": "string",
+                        "description": "RESOLVED: facts the metadata confirms; PARTIAL: facts, but part of the statement is still unknown; UNCONFIRMED: the statement is known, but none of its edges has both endpoints in the metadata; FAILED: GSP could not evaluate the procedure; otherwise GSP's status for the site"
+                      },
+                      "facts": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Edges the metadata confirms: origin DYNAMIC, verification VERIFIED"
+                      },
+                      "sql": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "description": "The statement the site runs with these parameters, when GSP could build it (clipped at 2000 characters)"
+                      },
+                      "reason": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    }
+                  }
                 }
               }
             }

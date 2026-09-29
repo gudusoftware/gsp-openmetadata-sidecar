@@ -280,6 +280,15 @@ What gets pushed — every fact in the file carries a `kind`:
 | `ROW_LEVEL`, `TABLE` | a table-level edge only (a row-level fact has no target column) |
 | `CONSTANT`, `CALL` | nothing (no source table / a procedure call, not data movement) |
 
+Every fact also says where it comes from: `origin` is `STATIC` (SQL written in the code) or
+`DYNAMIC` (reconstructed from a statement the code builds at run time, `EXEC(@sql)`), and
+`verification` is `VERIFIED` or `UNVERIFIED`. A static fact is always verified; a dynamic one is
+verified when the evaluator resolved both its endpoints against the metadata. An **unverified**
+fact is a candidate: it is never pushed, and the plan lists it under "unverified dynamic SQL
+candidates" so you can check it yourself. A procedure's `dynamicSql` (its dynamic SQL sites and
+what each parameter set its callers pass made of them) is the evaluator's report: it is checked
+against the schema like the rest of the file, and nothing in it is pushed.
+
 `--indirect-columns` decides which indirect column facts also become column mappings. Each such
 mapping is its own `columnsLineage` entry whose `function` names its type — OpenMetadata shows it
 as "SQL Function" when you click the column-level edge:
