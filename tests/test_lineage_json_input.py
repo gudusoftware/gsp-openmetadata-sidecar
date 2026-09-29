@@ -517,7 +517,11 @@ def test_a_malformed_table_response_is_a_lookup_failure(path, body):
         catalog().table("svc.SalesDB.dbo.customers")
 
 
-@pytest.mark.parametrize("body", ["<html>oops</html>", '{"hits": []}', '{"hits": {"hits": {}}}'])
+@pytest.mark.parametrize("body", ["<html>oops</html>", '{"hits": []}', '{"hits": {"hits": {}}}',
+                                  '{"total": 0}',                                      # no hits at all
+                                  '{"hits": {"hits": [{"_source": {"fullyQualifiedName": null}}]}}',
+                                  '{"hits": {"hits": [{"_source": {"fullyQualifiedName": ["x"]}}]}}',
+                                  '{"hits": {"hits": [{"id": 1}]}}', '{"hits": {"hits": ["x"]}}'])
 @responses.activate
 def test_a_malformed_search_response_is_a_lookup_failure(body):
     responses.get(f"{OM}/v1/tables/name/{quote('svc.SalesDB.dbo.customers', safe='')}", status=404)

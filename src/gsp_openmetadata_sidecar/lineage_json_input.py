@@ -521,14 +521,18 @@ class Catalog:
             escaped = fqn.replace("\\", "\\\\").replace('"', '\\"')
             resp = self._get("/v1/search/query", q=f'fullyQualifiedName:"{escaped}"',
                              index="table_search_index", size=10)
-            hits = []
+            names: set[str] = set()
             if resp.status_code == 200:
-                outer = self._object(resp, "GET /v1/search/query").get("hits", {})
-                hits = outer.get("hits", []) if isinstance(outer, dict) else None
+                outer = self._object(resp, "GET /v1/search/query").get("hits")
+                hits = outer.get("hits") if isinstance(outer, dict) else None
                 if not isinstance(hits, list):
                     raise LookupFailed("GET /v1/search/query: no hits list in the response")
-            names = {h["_source"].get("fullyQualifiedName", "") for h in hits
-                     if isinstance(h, dict) and isinstance(h.get("_source"), dict)}
+                for hit in hits:
+                    source = hit.get("_source") if isinstance(hit, dict) else None
+                    name = source.get("fullyQualifiedName") if isinstance(source, dict) else None
+                    if not isinstance(name, str):
+                        raise LookupFailed("GET /v1/search/query: a hit without a fullyQualifiedName")
+                    names.add(name)
             matches = sorted(n for n in names if n.lower() == fqn.lower())
             if len(matches) == 1:
                 entity = self._by_fqn(matches[0])
